@@ -155,10 +155,10 @@ class _LiveViewTabState extends State<LiveViewTab> {
                   ],
                 ),
                 const SizedBox(height: 8),
-                Row(
+                const Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('Battery:'),
+                    Text('Battery:'),
                     Text('85%'),
                   ],
                 ),

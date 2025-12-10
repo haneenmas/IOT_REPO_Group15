@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_mjpeg/flutter_mjpeg.dart'; // Ensure this is imported
-
+import 'package:flutter_mjpeg/flutter_mjpeg.dart';
+import 'package:firebase_database/firebase_database.dart';
 import '../../../services/doorbell_service.dart';
 
 class LiveViewTab extends StatefulWidget {
@@ -11,14 +11,34 @@ class LiveViewTab extends StatefulWidget {
   State<LiveViewTab> createState() => _LiveViewTabState();
 }
 
-
 class _LiveViewTabState extends State<LiveViewTab> {
-  bool _isUnlocking = false;
-  bool _isPlayingMessage = false;
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+  
+  // We start with an empty URL until Firebase gives us the real one
+  String _streamUrl = "";
+  String _cameraIp = "Loading...";
 
-  // 🔴 IMPORTANT: This must match your ESP32 IP exactly
-  // Port 81 is standard for the video stream
-  final String _streamUrl = 'http://192.168.1.22:81/stream';
+  @override
+  void initState() {
+    super.initState();
+    _setupListeners();
+  }
+
+  void _setupListeners() {
+    // 1. LISTEN FOR CAMERA IP UPDATES
+    // The Camera uploads its IP to "/camera_ip"
+    _dbRef.child('camera_ip').onValue.listen((event) {
+      final val = event.snapshot.value;
+      if (val != null) {
+        setState(() {
+          _cameraIp = val.toString();
+          // Construct the full URL: http://[IP]:81/stream
+          _streamUrl = 'http://$_cameraIp:81/stream';
+        });
+        print("New Camera IP received: $_cameraIp");
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -26,7 +46,40 @@ class _LiveViewTabState extends State<LiveViewTab> {
       padding: const EdgeInsets.all(16),
       child: Column(
         children: [
-          // LIVE VIDEO BOX
+          // 1. DOOR STATUS CARD
+          StreamBuilder(
+            stream: _dbRef.child('door_status').onValue,
+            builder: (context, snapshot) {
+              String status = "Unknown";
+              if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+                status = snapshot.data!.snapshot.value.toString();
+              }
+              bool isOpen = (status == "Open");
+              
+              return Container(
+                margin: const EdgeInsets.only(bottom: 16),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: isOpen ? Colors.green.shade100 : Colors.red.shade100,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: isOpen ? Colors.green : Colors.red),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(isOpen ? Icons.lock_open : Icons.lock, color: isOpen ? Colors.green : Colors.red),
+                    const SizedBox(width: 10),
+                    Text(
+                      "Door is $status", 
+                      style: TextStyle(fontWeight: FontWeight.bold, color: isOpen ? Colors.green.shade900 : Colors.red.shade900)
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+
+          // 2. LIVE VIDEO BOX (Dynamic!)
           Container(
             height: 300,
             width: double.infinity,
@@ -37,102 +90,62 @@ class _LiveViewTabState extends State<LiveViewTab> {
             ),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(12),
-              child: Mjpeg(
-                isLive: true,
-                stream: _streamUrl,
-                timeout: const Duration(seconds: 10), // Retry if connection drops
-                loading: (context) => const Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      CircularProgressIndicator(color: Colors.white),
-                      SizedBox(height: 10),
-                      Text("Connecting to Doorbell...", 
-                          style: TextStyle(color: Colors.white)),
-                    ],
-                  ),
-                ),
-                error: (context, error, stack) => const Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.videocam_off, color: Colors.white54, size: 48),
-                      Text("Stream Offline", style: TextStyle(color: Colors.white54)),
-                      Text("Check if ESP32 is powered on", 
-                          style: TextStyle(color: Colors.white24, fontSize: 12)),
-                    ],
-                  ),
-                ),
-              ),
+              child: _streamUrl.isEmpty
+                  ? const Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          CircularProgressIndicator(color: Colors.white),
+                          SizedBox(height: 10),
+                          Text("Fetching Camera IP...", style: TextStyle(color: Colors.white)),
+                        ],
+                      ),
+                    )
+                  : Mjpeg(
+                      isLive: true,
+                      stream: _streamUrl,
+                      // Increase timeout for slow networks
+                      timeout: const Duration(seconds: 20), 
+                      loading: (context) => Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const CircularProgressIndicator(color: Colors.white),
+                            const SizedBox(height: 10),
+                            Text("Connecting to $_cameraIp...", 
+                                style: const TextStyle(color: Colors.white)),
+                          ],
+                        ),
+                      ),
+                      error: (context, error, stack) => Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Icon(Icons.videocam_off, color: Colors.white54, size: 48),
+                            const Text("Stream Offline", style: TextStyle(color: Colors.white54)),
+                            Text("IP: $_cameraIp", style: const TextStyle(color: Colors.white24, fontSize: 10)),
+                          ],
+                        ),
+                      ),
+                    ),
             ),
           ),
           
+          const SizedBox(height: 10),
+          Text("Camera IP: $_cameraIp", style: const TextStyle(color: Colors.grey, fontSize: 12)),
           const SizedBox(height: 24),
 
-          // EXISTING CONTROLS
+          // 3. CONTROLS
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
               onPressed: () {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Snapshot captured!'))
+                  const SnackBar(content: Text('Snapshot feature coming soon!'))
                 );
               },
               icon: const Icon(Icons.camera_alt),
               label: const Text('Take Snapshot'),
-            ),
-          ),
-          
-          const SizedBox(height: 12),
-          
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              onPressed: _isUnlocking ? null : () async {
-                setState(() => _isUnlocking = true);
-                // Simulate delay or call your actual service
-                await Future.delayed(const Duration(seconds: 2)); 
-                if (mounted) {
-                  setState(() => _isUnlocking = false);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Door unlocked!'))
-                  );
-                }
-              },
-              icon: _isUnlocking
-                  ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.lock_open),
-              label: const Text('Remote Unlock'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.green,
-                foregroundColor: Colors.white,
-              ),
-            ),
-          ),
-
-          const SizedBox(height: 12),
-
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              onPressed: _isPlayingMessage ? null : () async {
-                 setState(() => _isPlayingMessage = true);
-                 await Future.delayed(const Duration(seconds: 2));
-                 if (mounted) {
-                   setState(() => _isPlayingMessage = false);
-                   ScaffoldMessenger.of(context).showSnackBar(
-                     const SnackBar(content: Text('Message Played!'))
-                   );
-                 }
-              },
-              icon: _isPlayingMessage
-                  ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.speaker),
-              label: const Text('Play Pre-Recorded Message'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.orange,
-                foregroundColor: Colors.white,
-              ),
             ),
           ),
         ],

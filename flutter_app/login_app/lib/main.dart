@@ -1,8 +1,21 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart'; // Add this
+import 'firebase_options.dart'; // Add this
 import 'screens/auth/login_page.dart';
 import 'screens/dashboard/dashboard_page.dart';
+import 'services/auth_service.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 1. INITIALIZE FIREBASE (Crucial!)
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+
+  // 2. Initialize Auth (Keep this for login)
+  await AuthService.init();
+
   runApp(const SmartDoorbellApp());
 }
 
@@ -13,6 +26,7 @@ class SmartDoorbellApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Smart Doorbell',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         primarySwatch: Colors.blue,
         useMaterial3: true,

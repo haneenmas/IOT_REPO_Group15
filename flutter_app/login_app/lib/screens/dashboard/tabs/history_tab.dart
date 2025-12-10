@@ -1,55 +1,43 @@
+import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_database/ui/firebase_animated_list.dart';
 import 'package:flutter/material.dart';
 import '../../../services/doorbell_service.dart';
 
 class HistoryTab extends StatelessWidget {
-  final DoorbellService doorbellService;
-  const HistoryTab({super.key, required this.doorbellService});
+  const HistoryTab({super.key, required DoorbellService doorbellService});
+
   @override
   Widget build(BuildContext context) {
-    final events = doorbellService.getEventHistory();
-    return ListView.builder(
-      padding: const EdgeInsets.all(12),
-      itemCount: events.length,
-      itemBuilder: (context, index) {
-        final event = events[index];
-        final icon = _getEventIcon(event.type);
-        final color = _getEventColor(event.type);
-        return Card(child: ListTile(leading: Icon(icon, color: color), title: Text(event.description ?? event.type), subtitle: Text(event.timestamp.toString().split('.')[0], style: const TextStyle(fontSize: 12)), trailing: event.type == 'snapshot' ? const Icon(Icons.image) : event.type == 'unlock' ? const Icon(Icons.lock_open) : null, onTap: () { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Event: ${event.description ?? event.type}'))); }));
-      },
+    final DatabaseReference dbRef = FirebaseDatabase.instance.ref().child('history');
+
+    return Scaffold(
+      body: Column(
+        children: [
+          const Padding(
+            padding: EdgeInsets.all(16.0),
+            child: Text("Recent Activity", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          ),
+          Expanded(
+            child: FirebaseAnimatedList(
+              query: dbRef.limitToLast(50),
+              sort: (a, b) => b.key!.compareTo(a.key!), // Newest first
+              itemBuilder: (context, snapshot, animation, index) {
+                return SizeTransition(
+                  sizeFactor: animation,
+                  child: Card(
+                    margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    child: ListTile(
+                      leading: const CircleAvatar(backgroundColor: Colors.green, child: Icon(Icons.lock_open, color: Colors.white)),
+                      title: Text(snapshot.value.toString()),
+                      trailing: const Icon(Icons.access_time, size: 16),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
     );
-  }
-
-  IconData _getEventIcon(String type) {
-    switch (type) {
-      case 'snapshot':
-        return Icons.camera;
-      case 'motion':
-        return Icons.directions_run;
-      case 'unlock':
-        return Icons.lock_open;
-      case 'failed_code':
-        return Icons.warning;
-      case 'message':
-        return Icons.speaker;
-      default:
-        return Icons.info;
-    }
-  }
-
-  Color _getEventColor(String type) {
-    switch (type) {
-      case 'snapshot':
-        return Colors.blue;
-      case 'motion':
-        return Colors.orange;
-      case 'unlock':
-        return Colors.green;
-      case 'failed_code':
-        return Colors.red;
-      case 'message':
-        return Colors.purple;
-      default:
-        return Colors.grey;
-    }
   }
 }

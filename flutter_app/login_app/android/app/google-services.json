@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "673672806430",
+    "firebase_url": "https://iot15-46c28-default-rtdb.firebaseio.com",
+    "project_id": "iot15-46c28",
+    "storage_bucket": "iot15-46c28.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:673672806430:android:f71476b191cc46ae02ae0f",
+        "android_client_info": {
+          "package_name": "com.example.login_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDVzEs0U397nzZuKDzf79l6Qu3TFJ8sByM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -132,8 +132,8 @@ class _LoginPageState extends State<LoginPage> {
                     color: Colors.blue.shade50,
                     borderRadius: BorderRadius.circular(8),
                   ),
-                  child: Column(
-                    children: const [
+                  child: const Column(
+                    children: [
                       Text('Demo Credentials:', style: TextStyle(fontWeight: FontWeight.bold)),
                       SizedBox(height: 8),
                       Text('Email: homeowner@smartdoor.com'),
