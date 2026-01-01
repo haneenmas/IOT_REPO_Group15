@@ -56,15 +56,6 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 #define BUTTON_PIN 41
 
 // ===========================
-// Door logic
-// ===========================
-static SemaphoreHandle_t doorMutex;
-
-volatile bool isDoorOpen = false;
-volatile unsigned long doorOpenTime = 0;
-const unsigned long AUTO_LOCK_DELAY = 60000;
-
-// ===========================
 // Firebase objects
 // ===========================
 FirebaseData fbdo;
@@ -72,45 +63,66 @@ FirebaseAuth auth;
 FirebaseConfig fconfig;
 
 // ===========================
+// Mutexes / Queues
+// ===========================
+static SemaphoreHandle_t doorMutex;
+static SemaphoreHandle_t codesMutex;
+QueueHandle_t unlockQueue;
+
+// ===========================
+// Door logic
+// ===========================
+volatile bool isDoorOpen = false;
+volatile unsigned long doorOpenTime = 0;
+const unsigned long AUTO_LOCK_DELAY = 60000;
+volatile bool doorStatusDirty = false;
+
+// ===========================
 // Cached access codes
 // ===========================
 String validCodesJson = "";
 volatile unsigned long lastCodesFetchMs = 0;
 
-// Fetch policy
 unsigned long lastUserActionMs = 0;
 const unsigned long IDLE_BEFORE_FETCH_MS = 2500;
-const unsigned long CODES_BACKGROUND_REFRESH_MS = 120000; // 2 minutes
-const unsigned long CODES_MAX_AGE_BEFORE_UNLOCK_MS = 10000; // 10s
+const unsigned long CODES_BACKGROUND_REFRESH_MS = 120000;   // 2 minutes
+const unsigned long CODES_MAX_AGE_BEFORE_UNLOCK_MS = 10000; // 10 seconds
+volatile bool codesRefreshRequested = false;
 
 // ===========================
-// Live mode variables (updated by Firebase task)
+// Live mode variables
 // ===========================
 volatile bool liveActive = false;
 volatile int liveFps = 1;
 unsigned long lastLiveSnapMs = 0;
 
-// polling periods (in Firebase task)
+// Polling periods (Firebase task)
 unsigned long lastCmdPoll = 0;
-const unsigned long CMD_POLL_MS = 800;   // was 500ms (less network pressure)
+const unsigned long CMD_POLL_MS = 800;
 unsigned long lastLivePoll = 0;
-const unsigned long LIVE_POLL_MS = 800;  // was 500ms
+const unsigned long LIVE_POLL_MS = 800;
+
+// Backoff after failures
+unsigned long liveBackoffUntil = 0;
+
+// Pause live while ring upload is running
+volatile bool ringInProgress = false;
 
 // ===========================
-// Fast button capture (interrupt)
-// ===========================
-volatile bool btnEdgeSeen = false;
-unsigned long lastRingMs = 0;
-const unsigned long RING_COOLDOWN_MS = 3000;
-
-// ring request handled in Firebase task
-volatile bool ringRequested = false;
-
-// ===========================
-// Door command from Firebase (applied in main loop, no blocking)
+// Remote command from Firebase -> applied locally
 // ===========================
 enum DoorCmd { DC_NONE, DC_LOCK, DC_UNLOCK };
 volatile DoorCmd pendingDoorCmd = DC_NONE;
+
+// ===========================
+// Fast button capture via ISR (debounced)
+// ===========================
+volatile uint16_t btnIsrCount = 0;
+volatile uint32_t lastBtnIsrUs = 0;
+const uint32_t BTN_BOUNCE_US = 80000; // 80ms ISR debounce
+unsigned long lastRingMs = 0;
+const unsigned long RING_COOLDOWN_MS = 3000;
+volatile bool ringRequested = false;
 
 // ===========================
 // Unlock event queue (main loop -> Firebase task)
@@ -121,29 +133,38 @@ typedef struct {
   bool isOtp;
 } UnlockEvent;
 
-QueueHandle_t unlockQueue;
-
 // ===========================
-// flags for Firebase task
+// Camera sensor pointer + profiles
 // ===========================
-volatile bool doorStatusDirty = false;
-volatile bool codesRefreshRequested = false;
-
-// Keep a global sensor pointer (optional)
 sensor_t* gSensor = nullptr;
 
 // startCameraServer() is in app_httpd.cpp
 void startCameraServer();
 
+void setCameraProfileLive() {
+  if (!gSensor) return;
+  gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120 (much smaller)
+  gSensor->set_quality(gSensor, 22);                // higher = smaller file
+}
+
+void setCameraProfileRing() {
+  if (!gSensor) return;
+  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240
+  gSensor->set_quality(gSensor, 18);                // smaller than default
+}
+
 // =====================================================
 // Button ISR
 // =====================================================
 void IRAM_ATTR onButtonFalling() {
-  btnEdgeSeen = true;
+  uint32_t now = micros();
+  if (now - lastBtnIsrUs < BTN_BOUNCE_US) return; // ignore bounce
+  lastBtnIsrUs = now;
+  btnIsrCount++;
 }
 
 // =====================================================
-// Small helpers: local door control (NO Firebase inside!)
+// Local door control (NO Firebase here)
 // =====================================================
 void unlockDoorLocal() {
   xSemaphoreTake(doorMutex, portMAX_DELAY);
@@ -163,7 +184,6 @@ void lockDoorLocal() {
 }
 
 void blinkErrorLocal() {
-  // short, does not touch Firebase
   for (int i = 0; i < 2; i++) {
     digitalWrite(LED_PIN, HIGH); delay(60);
     digitalWrite(LED_PIN, LOW);  delay(60);
@@ -171,7 +191,7 @@ void blinkErrorLocal() {
 }
 
 // =====================================================
-// Firebase helpers (USED ONLY in Firebase task)
+// Firebase helpers (Firebase task only)
 // =====================================================
 void updateDoorStatusFirebase(const String& status) {
   if (Firebase.ready()) {
@@ -209,7 +229,12 @@ void fetchAccessCodesFirebase() {
 
   Serial.print("Updating codes... ");
   if (Firebase.RTDB.getJSON(&fbdo, "/access_codes")) {
-    validCodesJson = fbdo.jsonString();
+    String json = fbdo.jsonString();
+
+    xSemaphoreTake(codesMutex, portMAX_DELAY);
+    validCodesJson = json;
+    xSemaphoreGive(codesMutex);
+
     lastCodesFetchMs = millis();
     Serial.println("Success! List updated.");
   } else {
@@ -217,8 +242,21 @@ void fetchAccessCodesFirebase() {
   }
 }
 
+bool setJSONWithRetry(const char* path, FirebaseJson& json, int tries = 3) {
+  for (int i = 0; i < tries; i++) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    if (Firebase.RTDB.setJSON(&fbdo, path, &json)) return true;
+
+    Serial.print("setJSON failed: ");
+    Serial.println(fbdo.errorReason());
+    vTaskDelay(pdMS_TO_TICKS(250 * (i + 1)));
+  }
+  return false;
+}
+
 // =====================================================
-// Snapshot -> Base64 (USED ONLY in Firebase task)
+// Snapshot -> Base64 (Firebase task only) + size prints
 // =====================================================
 String captureJpegToBase64() {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -232,8 +270,12 @@ String captureJpegToBase64() {
     return "";
   }
 
+  Serial.print("JPEG bytes: ");
+  Serial.println(fb->len);
+
   size_t outLen = 0;
   size_t maxOut = 4 * ((fb->len + 2) / 3) + 1;
+
   unsigned char* outBuf = (unsigned char*)malloc(maxOut);
   if (!outBuf) {
     Serial.println("malloc failed for base64");
@@ -249,6 +291,9 @@ String captureJpegToBase64() {
     free(outBuf);
     return "";
   }
+
+  Serial.print("B64 bytes: ");
+  Serial.println((int)outLen);
 
   outBuf[outLen] = '\0';
   String b64 = String((char*)outBuf);
@@ -275,13 +320,15 @@ void pushHistoryEventFirebase(const String& action, const String& by, const Stri
 }
 
 // =====================================================
-// Doorbell press event (Firebase task)
+// Doorbell event (Firebase task): ring profile -> snapshot -> notif + history
 // =====================================================
 void handleDoorbellEventFirebase() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected -> doorbell event skipped");
     return;
   }
+
+  setCameraProfileRing(); // ✅ smaller ring payload
 
   String b64 = captureJpegToBase64();
   if (b64.isEmpty()) {
@@ -317,11 +364,13 @@ void handleDoorbellEventFirebase() {
 }
 
 // =====================================================
-// Live mode snapshot push (Firebase task)
+// Live latest snapshot (Firebase task): live profile -> setJSON retry + backoff
 // =====================================================
 void pushLiveLatestSnapshotFirebase() {
   if (!Firebase.ready()) return;
   if (WiFi.status() != WL_CONNECTED) return;
+  if (ringInProgress) return;                 // don't fight ring upload
+  if (millis() < liveBackoffUntil) return;    // backoff after failures
 
   int fpsLocal = liveFps;
   if (fpsLocal < 1) fpsLocal = 1;
@@ -331,6 +380,8 @@ void pushLiveLatestSnapshotFirebase() {
   if (millis() - lastLiveSnapMs < intervalMs) return;
   lastLiveSnapMs = millis();
 
+  setCameraProfileLive(); // ✅ much smaller live payload
+
   String b64 = captureJpegToBase64();
   if (b64.isEmpty()) return;
 
@@ -339,13 +390,20 @@ void pushLiveLatestSnapshotFirebase() {
   live.set("format", "jpeg_base64");
   live.set("image", b64);
 
-  if (!Firebase.RTDB.setJSON(&fbdo, "/live/latest", &live)) {
-    Serial.println(String("live/latest setJSON failed: ") + fbdo.errorReason());
+  if (!setJSONWithRetry("/live/latest", live, 2)) {
+    Serial.print("WiFi=");
+    Serial.print(WiFi.status());
+    Serial.print(" RSSI=");
+    Serial.print(WiFi.RSSI());
+    Serial.print(" Heap=");
+    Serial.println(ESP.getFreeHeap());
+
+    liveBackoffUntil = millis() + 3000; // wait 3s then try again
   }
 }
 
 // =====================================================
-// Firebase polling (Firebase task)
+// Poll remote command / live settings (Firebase task)
 // =====================================================
 void pollRemoteCommandFirebase() {
   if (millis() - lastCmdPoll < CMD_POLL_MS) return;
@@ -357,8 +415,8 @@ void pollRemoteCommandFirebase() {
     cmd.trim();
 
     if (cmd == "LOCK") {
-      pendingDoorCmd = DC_LOCK;      // applied in main loop
-      setDoorCommandNoneFirebase();  // clear in Firebase
+      pendingDoorCmd = DC_LOCK;
+      setDoorCommandNoneFirebase();
     } else if (cmd == "UNLOCK") {
       pendingDoorCmd = DC_UNLOCK;
       setDoorCommandNoneFirebase();
@@ -371,12 +429,10 @@ void pollLiveSettingsFirebase() {
   lastLivePoll = millis();
   if (!Firebase.ready()) return;
 
-  // active
   if (Firebase.RTDB.getBool(&fbdo, "/live/active")) {
     liveActive = fbdo.boolData();
   }
 
-  // fps
   if (Firebase.RTDB.getInt(&fbdo, "/live/fps")) {
     int v = fbdo.intData();
     if (v >= 1 && v <= 5) liveFps = v;
@@ -387,7 +443,6 @@ void maybeFetchAccessCodesSafelyFirebase() {
   if (!Firebase.ready()) return;
 
   if (codesRefreshRequested) {
-    // refresh ASAP when requested (but still avoid while user is typing)
     if (millis() - lastUserActionMs > IDLE_BEFORE_FETCH_MS) {
       codesRefreshRequested = false;
       fetchAccessCodesFirebase();
@@ -395,30 +450,44 @@ void maybeFetchAccessCodesSafelyFirebase() {
     return;
   }
 
-  // background refresh (only when idle and old enough)
   if (millis() - lastUserActionMs < IDLE_BEFORE_FETCH_MS) return;
+
   if (millis() - lastCodesFetchMs > CODES_BACKGROUND_REFRESH_MS) {
     fetchAccessCodesFirebase();
   }
 }
 
 // =====================================================
-// Firebase Task: all heavy work here
+// Firebase Task
 // =====================================================
 void firebaseTask(void* pv) {
   (void)pv;
 
+  bool didInitNodes = false;
+
   for (;;) {
-    // 1) Ring event
-    if (ringRequested) {
-      ringRequested = false;
-      handleDoorbellEventFirebase();
+    if (!didInitNodes && Firebase.ready()) {
+      didInitNodes = true;
+      Firebase.RTDB.setBool(&fbdo, "/live/active", false);
+      Firebase.RTDB.setInt(&fbdo, "/live/fps", 1);
+      setDoorCommandNoneFirebase();
+      updateDoorStatusFirebase("Closed");
+      codesRefreshRequested = true;
     }
 
-    // 2) process unlock queue events
+    // 1) Ring event (pause live while ringing)
+    if (ringRequested) {
+      ringRequested = false;
+      ringInProgress = true;
+      handleDoorbellEventFirebase();
+      ringInProgress = false;
+    }
+
+    // 2) Process unlock queue
     UnlockEvent ev;
     while (xQueueReceive(unlockQueue, &ev, 0) == pdTRUE) {
       pushHistoryEventFirebase("unlock", String(ev.user), "");
+
       if (ev.isOtp) {
         Serial.println("One-Time Code used. Deleting...");
         String path = String("/access_codes/") + String(ev.code);
@@ -427,9 +496,10 @@ void firebaseTask(void* pv) {
       }
     }
 
-    // 3) update door status if dirty
+    // 3) Update door status if dirty
     if (doorStatusDirty && Firebase.ready()) {
       doorStatusDirty = false;
+
       bool openLocal;
       xSemaphoreTake(doorMutex, portMAX_DELAY);
       openLocal = isDoorOpen;
@@ -442,27 +512,46 @@ void firebaseTask(void* pv) {
     pollRemoteCommandFirebase();
     pollLiveSettingsFirebase();
 
-    // 5) live snapshots
+    // 5) Live snapshots
     if (liveActive) {
       pushLiveLatestSnapshotFirebase();
     }
 
-    // 6) background codes refresh
+    // 6) Background codes refresh
     maybeFetchAccessCodesSafelyFirebase();
 
-    // small sleep to yield CPU, keep stable
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 // =====================================================
-// Access check in main loop (NO Firebase calls!)
+// Cache-based JSON lookup (main loop, NO Firebase)
 // =====================================================
-String getUserNameFromCache(const String& code) {
-  if (validCodesJson.length() == 0) return "Unknown";
+bool codeExistsInCache(const String& code) {
+  String localJson;
+  xSemaphoreTake(codesMutex, portMAX_DELAY);
+  localJson = validCodesJson;
+  xSemaphoreGive(codesMutex);
+
+  if (localJson.length() == 0) return false;
 
   FirebaseJson json;
-  json.setJsonData(validCodesJson);
+  json.setJsonData(localJson);
+
+  FirebaseJsonData data;
+  return json.get(data, code);
+}
+
+String getUserNameFromCache(const String& code) {
+  String localJson;
+  xSemaphoreTake(codesMutex, portMAX_DELAY);
+  localJson = validCodesJson;
+  xSemaphoreGive(codesMutex);
+
+  if (localJson.length() == 0) return "Unknown";
+
+  FirebaseJson json;
+  json.setJsonData(localJson);
 
   FirebaseJsonData data;
   if (json.get(data, code)) {
@@ -472,19 +561,6 @@ String getUserNameFromCache(const String& code) {
   }
   return "Unknown";
 }
-
-bool codeExistsInCache(const String& code) {
-  // fast key existence check by parsing (not indexOf)
-  if (validCodesJson.length() == 0) return false;
-
-  FirebaseJson json;
-  json.setJsonData(validCodesJson);
-
-  FirebaseJsonData data;
-  return json.get(data, code);
-}
-
-String inputCode = "";
 
 // =====================================================
 // Setup
@@ -501,6 +577,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonFalling, FALLING);
 
   doorMutex = xSemaphoreCreateMutex();
+  codesMutex = xSemaphoreCreateMutex();
   unlockQueue = xQueueCreate(8, sizeof(UnlockEvent));
 
   // ---------------- Camera init
@@ -553,13 +630,15 @@ void setup() {
     return;
   }
 
-  sensor_t* s = esp_camera_sensor_get();
-  gSensor = s;
-  s->set_framesize(s, FRAMESIZE_QVGA);
+  // sensor pointer
+  gSensor = esp_camera_sensor_get();
 
 #if defined(CAMERA_MODEL_ESP32S3_EYE)
-  s->set_vflip(s, 1);
+  if (gSensor) gSensor->set_vflip(gSensor, 1);
 #endif
+
+  // default to ring profile
+  setCameraProfileRing();
 
   // ---------------- WiFi
   WiFi.begin(ssid, password);
@@ -585,22 +664,16 @@ void setup() {
   fconfig.database_url = DATABASE_URL;
   fconfig.signer.test_mode = true;
 
-  // bigger SSL buffers
   fbdo.setBSSLBufferSize(16384, 16384);
   fconfig.timeout.serverResponse = 15000;
 
   Firebase.begin(&fconfig, &auth);
   Firebase.reconnectWiFi(true);
 
-  // defaults (non-blocking)
-  // We'll do the first writes in the task when ready
   doorStatusDirty = true;
-
-  // initial codes fetch request (task will do it once idle)
-  codesRefreshRequested = true;
   lastUserActionMs = millis();
 
-  // Create Firebase task pinned to core 1 (main loop stays super responsive)
+  // Create Firebase task pinned to core 1
   xTaskCreatePinnedToCore(
     firebaseTask,
     "firebaseTask",
@@ -613,25 +686,30 @@ void setup() {
 }
 
 // =====================================================
-// Loop (FAST: keypad + button + door state only)
+// Loop (FAST)
 // =====================================================
+String inputCode = "";
+
 void loop() {
-  // 1) Button press: ISR -> here we apply cooldown and request ring
-  if (btnEdgeSeen) {
-    btnEdgeSeen = false;
+  // 1) Handle all ISR button presses safely (debounced count)
+  static uint16_t lastHandled = 0;
+  uint16_t cur = btnIsrCount;
+
+  while (lastHandled != cur) {
+    lastHandled++;
     lastUserActionMs = millis();
 
-    unsigned long now = millis();
-    if (now - lastRingMs > RING_COOLDOWN_MS) {
-      lastRingMs = now;
+    unsigned long nowMs = millis();
+    if (nowMs - lastRingMs > RING_COOLDOWN_MS) {
+      lastRingMs = nowMs;
       ringRequested = true;
-      Serial.println("Doorbell button pressed! (fast ISR capture)");
+      Serial.println("Doorbell button pressed! (queued)");
     } else {
-      Serial.println("Doorbell pressed too fast (ignored)");
+      Serial.println("Doorbell ignored (cooldown)");
     }
   }
 
-  // 2) Apply remote command (set by Firebase task)
+  // 2) Apply remote command locally
   DoorCmd cmd = pendingDoorCmd;
   if (cmd != DC_NONE) {
     pendingDoorCmd = DC_NONE;
@@ -639,35 +717,41 @@ void loop() {
     else if (cmd == DC_UNLOCK) unlockDoorLocal();
   }
 
-  // 3) Keypad read (fast)
+  // 3) Keypad read + Serial prints
   char key;
-  // read quickly in case multiple keys were pressed
   while ((key = keypad.getKey())) {
     lastUserActionMs = millis();
 
+    Serial.print("Keypad pressed: ");
+    Serial.println(key);
+
     if (key == '#') {
+      Serial.print("Entered code: ");
+      Serial.println(inputCode);
+
       if (inputCode.length() < 4) {
+        Serial.println("Too short ❌");
         blinkErrorLocal();
         inputCode = "";
         break;
       }
 
-      // If cache old, request refresh in background (but do NOT block)
       if (millis() - lastCodesFetchMs > CODES_MAX_AGE_BEFORE_UNLOCK_MS) {
-        codesRefreshRequested = true;
+        codesRefreshRequested = true; // background refresh
       }
 
       if (codeExistsInCache(inputCode)) {
+        Serial.println("ACCESS GRANTED ✅");
         String userName = getUserNameFromCache(inputCode);
         unlockDoorLocal();
 
-        // enqueue history + OTP delete in background
         UnlockEvent ev{};
         strncpy(ev.code, inputCode.c_str(), sizeof(ev.code) - 1);
         strncpy(ev.user, userName.c_str(), sizeof(ev.user) - 1);
         ev.isOtp = (userName == "OTP_Visitor");
         xQueueSend(unlockQueue, &ev, 0);
       } else {
+        Serial.println("ACCESS DENIED ❌");
         blinkErrorLocal();
       }
 
@@ -676,6 +760,7 @@ void loop() {
     }
 
     if (key == '*') {
+      Serial.println("Entry cleared (*)");
       if (isDoorOpen) lockDoorLocal();
       inputCode = "";
       break;
@@ -683,13 +768,17 @@ void loop() {
 
     // digit
     inputCode += key;
-    if (inputCode.length() > 10) { // safety
+    Serial.print("Current buffer: ");
+    Serial.println(inputCode);
+
+    if (inputCode.length() > 10) {
+      Serial.println("Buffer too long -> cleared");
       inputCode = "";
       blinkErrorLocal();
     }
   }
 
-  // 4) Auto relock (fast)
+  // 4) Auto-relock
   bool openLocal;
   unsigned long openTimeLocal;
   xSemaphoreTake(doorMutex, portMAX_DELAY);
@@ -698,9 +787,9 @@ void loop() {
   xSemaphoreGive(doorMutex);
 
   if (openLocal && (millis() - openTimeLocal >= AUTO_LOCK_DELAY)) {
+    Serial.println("Auto-Relock triggered.");
     lockDoorLocal();
   }
 
-  // no heavy delay; keep scanning fast
   delay(1);
 }
