@@ -21,15 +21,14 @@
 // ===========================
 // WiFi credentials
 // ===========================
-const char* ssid = "HOTBOX-7F46";
-const char* password = "wifiwifi";
+const char* ssid = "bezeqfiber";
+const char* password = "0522441867";
 
 // ===========================
 // Firebase credentials
 // ===========================
 #define API_KEY "AIzaSyAZZFAOF2lEXONTwvi1iNaMZvJiPETzlpE"
 #define DATABASE_URL "iot15-46c28-default-rtdb.firebaseio.com"
-
 // ===========================
 // Keypad setup
 // ===========================
@@ -141,16 +140,35 @@ sensor_t* gSensor = nullptr;
 // startCameraServer() is in app_httpd.cpp
 void startCameraServer();
 
-void setCameraProfileLive() {
+// ===========================
+// ✅ NEW: LAN publish state
+// ===========================
+String lastPublishedIp = "";
+unsigned long lastLanPublishMs = 0;
+const unsigned long LAN_PUBLISH_MS = 30000; // publish at boot + every 30s (or when IP changes)
+
+// ===========================
+// ✅ NEW: adaptive live clarity
+// ===========================
+unsigned long forceSmallLiveUntil = 0; // if live fails, force small profile for some time
+
+// ---------- Camera profiles ----------
+void setCameraProfileLiveSmall() {
   if (!gSensor) return;
-  gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120 (much smaller)
-  gSensor->set_quality(gSensor, 22);                // higher = smaller file
+  gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120
+  gSensor->set_quality(gSensor, 22);                // smaller file
+}
+
+void setCameraProfileLiveClear() {
+  if (!gSensor) return;
+  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240 (clearer)
+  gSensor->set_quality(gSensor, 16);                // clearer but larger
 }
 
 void setCameraProfileRing() {
   if (!gSensor) return;
   gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240
-  gSensor->set_quality(gSensor, 18);                // smaller than default
+  gSensor->set_quality(gSensor, 18);                // stable size
 }
 
 // =====================================================
@@ -158,7 +176,7 @@ void setCameraProfileRing() {
 // =====================================================
 void IRAM_ATTR onButtonFalling() {
   uint32_t now = micros();
-  if (now - lastBtnIsrUs < BTN_BOUNCE_US) return; // ignore bounce
+  if (now - lastBtnIsrUs < BTN_BOUNCE_US) return;
   lastBtnIsrUs = now;
   btnIsrCount++;
 }
@@ -194,15 +212,40 @@ void blinkErrorLocal() {
 // Firebase helpers (Firebase task only)
 // =====================================================
 void updateDoorStatusFirebase(const String& status) {
-  if (Firebase.ready()) {
-    Firebase.RTDB.setString(&fbdo, "/door_status", status);
-  }
+  if (Firebase.ready()) Firebase.RTDB.setString(&fbdo, "/door_status", status);
 }
 
 void setDoorCommandNoneFirebase() {
-  if (Firebase.ready()) {
-    Firebase.RTDB.setString(&fbdo, "/door_command", "NONE");
+  if (Firebase.ready()) Firebase.RTDB.setString(&fbdo, "/door_command", "NONE");
+}
+
+// ✅ NEW: publish LAN stream URL to Firebase
+void publishLanInfoFirebase(bool force = false) {
+  if (!Firebase.ready()) return;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Firebase.RTDB.setBool(&fbdo, "/lan/online", false);
+    return;
   }
+
+  String ip = WiFi.localIP().toString();
+  if (!force && ip == lastPublishedIp && (millis() - lastLanPublishMs) < LAN_PUBLISH_MS) return;
+
+  String url = "http://" + ip + ":81/stream";
+
+  Firebase.RTDB.setString(&fbdo, "/lan/ip", ip);
+  Firebase.RTDB.setString(&fbdo, "/lan/stream_url", url);
+  Firebase.RTDB.setBool(&fbdo, "/lan/online", true);
+
+  FirebaseJson ts;
+  ts.set(".sv", "timestamp");
+  Firebase.RTDB.setJSON(&fbdo, "/lan/ts", &ts);
+
+  lastPublishedIp = ip;
+  lastLanPublishMs = millis();
+
+  Serial.print("✅ Published LAN URL: ");
+  Serial.println(url);
 }
 
 bool pushJsonWithServerTs(const char* path, FirebaseJson& jsonOut, String& pushedKey) {
@@ -260,18 +303,10 @@ bool setJSONWithRetry(const char* path, FirebaseJson& json, int tries = 3) {
 // =====================================================
 String captureJpegToBase64() {
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Snapshot failed: fb null");
-    return "";
-  }
-  if (fb->format != PIXFORMAT_JPEG) {
-    Serial.println("Snapshot not JPEG");
-    esp_camera_fb_return(fb);
-    return "";
-  }
+  if (!fb) { Serial.println("Snapshot failed: fb null"); return ""; }
+  if (fb->format != PIXFORMAT_JPEG) { Serial.println("Snapshot not JPEG"); esp_camera_fb_return(fb); return ""; }
 
-  Serial.print("JPEG bytes: ");
-  Serial.println(fb->len);
+  Serial.print("JPEG bytes: "); Serial.println(fb->len);
 
   size_t outLen = 0;
   size_t maxOut = 4 * ((fb->len + 2) / 3) + 1;
@@ -286,14 +321,9 @@ String captureJpegToBase64() {
   int ret = mbedtls_base64_encode(outBuf, maxOut, &outLen, fb->buf, fb->len);
   esp_camera_fb_return(fb);
 
-  if (ret != 0) {
-    Serial.println("base64 encode failed");
-    free(outBuf);
-    return "";
-  }
+  if (ret != 0) { Serial.println("base64 encode failed"); free(outBuf); return ""; }
 
-  Serial.print("B64 bytes: ");
-  Serial.println((int)outLen);
+  Serial.print("B64 bytes: "); Serial.println((int)outLen);
 
   outBuf[outLen] = '\0';
   String b64 = String((char*)outBuf);
@@ -314,13 +344,11 @@ void pushHistoryEventFirebase(const String& action, const String& by, const Stri
   if (snapshotKey.length() > 0) json.set("snapshotKey", snapshotKey);
 
   String histKey;
-  if (pushJsonWithServerTs("/history", json, histKey)) {
-    Serial.println("History pushed: " + histKey);
-  }
+  if (pushJsonWithServerTs("/history", json, histKey)) Serial.println("History pushed: " + histKey);
 }
 
 // =====================================================
-// Doorbell event (Firebase task): ring profile -> snapshot -> notif + history
+// Doorbell event (Firebase task)
 // =====================================================
 void handleDoorbellEventFirebase() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -328,13 +356,10 @@ void handleDoorbellEventFirebase() {
     return;
   }
 
-  setCameraProfileRing(); // ✅ smaller ring payload
+  setCameraProfileRing();
 
   String b64 = captureJpegToBase64();
-  if (b64.isEmpty()) {
-    Serial.println("Snapshot base64 empty -> skip event");
-    return;
-  }
+  if (b64.isEmpty()) { Serial.println("Snapshot base64 empty -> skip event"); return; }
 
   FirebaseJson snap;
   snap.set("ts/.sv", "timestamp");
@@ -356,21 +381,19 @@ void handleDoorbellEventFirebase() {
   notif.set("snapshotKey", snapKey);
 
   String notifKey;
-  if (pushJsonWithServerTs("/notifications", notif, notifKey)) {
-    Serial.println("Notification pushed: " + notifKey);
-  }
+  if (pushJsonWithServerTs("/notifications", notif, notifKey)) Serial.println("Notification pushed: " + notifKey);
 
   pushHistoryEventFirebase("ring", "Visitor", snapKey);
 }
 
 // =====================================================
-// Live latest snapshot (Firebase task): live profile -> setJSON retry + backoff
+// Live latest snapshot (Firebase task): clearer when possible
 // =====================================================
 void pushLiveLatestSnapshotFirebase() {
   if (!Firebase.ready()) return;
   if (WiFi.status() != WL_CONNECTED) return;
-  if (ringInProgress) return;                 // don't fight ring upload
-  if (millis() < liveBackoffUntil) return;    // backoff after failures
+  if (ringInProgress) return;
+  if (millis() < liveBackoffUntil) return;
 
   int fpsLocal = liveFps;
   if (fpsLocal < 1) fpsLocal = 1;
@@ -380,7 +403,10 @@ void pushLiveLatestSnapshotFirebase() {
   if (millis() - lastLiveSnapMs < intervalMs) return;
   lastLiveSnapMs = millis();
 
-  setCameraProfileLive(); // ✅ much smaller live payload
+  // ✅ clearer when fps is low and no recent failures
+  bool forceSmall = (millis() < forceSmallLiveUntil);
+  if (!forceSmall && fpsLocal <= 1) setCameraProfileLiveClear();
+  else setCameraProfileLiveSmall();
 
   String b64 = captureJpegToBase64();
   if (b64.isEmpty()) return;
@@ -391,14 +417,13 @@ void pushLiveLatestSnapshotFirebase() {
   live.set("image", b64);
 
   if (!setJSONWithRetry("/live/latest", live, 2)) {
-    Serial.print("WiFi=");
-    Serial.print(WiFi.status());
-    Serial.print(" RSSI=");
-    Serial.print(WiFi.RSSI());
-    Serial.print(" Heap=");
-    Serial.println(ESP.getFreeHeap());
+    Serial.print("WiFi="); Serial.print(WiFi.status());
+    Serial.print(" RSSI="); Serial.print(WiFi.RSSI());
+    Serial.print(" Heap="); Serial.println(ESP.getFreeHeap());
 
-    liveBackoffUntil = millis() + 3000; // wait 3s then try again
+    // ✅ if it fails, force small live for 60 seconds
+    forceSmallLiveUntil = millis() + 60000;
+    liveBackoffUntil = millis() + 3000;
   }
 }
 
@@ -429,9 +454,7 @@ void pollLiveSettingsFirebase() {
   lastLivePoll = millis();
   if (!Firebase.ready()) return;
 
-  if (Firebase.RTDB.getBool(&fbdo, "/live/active")) {
-    liveActive = fbdo.boolData();
-  }
+  if (Firebase.RTDB.getBool(&fbdo, "/live/active")) liveActive = fbdo.boolData();
 
   if (Firebase.RTDB.getInt(&fbdo, "/live/fps")) {
     int v = fbdo.intData();
@@ -452,9 +475,7 @@ void maybeFetchAccessCodesSafelyFirebase() {
 
   if (millis() - lastUserActionMs < IDLE_BEFORE_FETCH_MS) return;
 
-  if (millis() - lastCodesFetchMs > CODES_BACKGROUND_REFRESH_MS) {
-    fetchAccessCodesFirebase();
-  }
+  if (millis() - lastCodesFetchMs > CODES_BACKGROUND_REFRESH_MS) fetchAccessCodesFirebase();
 }
 
 // =====================================================
@@ -468,14 +489,21 @@ void firebaseTask(void* pv) {
   for (;;) {
     if (!didInitNodes && Firebase.ready()) {
       didInitNodes = true;
+
       Firebase.RTDB.setBool(&fbdo, "/live/active", false);
       Firebase.RTDB.setInt(&fbdo, "/live/fps", 1);
       setDoorCommandNoneFirebase();
       updateDoorStatusFirebase("Closed");
       codesRefreshRequested = true;
+
+      // ✅ publish LAN info immediately when Firebase ready
+      publishLanInfoFirebase(true);
     }
 
-    // 1) Ring event (pause live while ringing)
+    // ✅ publish LAN info periodically (or if IP changes)
+    if (Firebase.ready()) publishLanInfoFirebase(false);
+
+    // 1) Ring event
     if (ringRequested) {
       ringRequested = false;
       ringInProgress = true;
@@ -513,9 +541,7 @@ void firebaseTask(void* pv) {
     pollLiveSettingsFirebase();
 
     // 5) Live snapshots
-    if (liveActive) {
-      pushLiveLatestSnapshotFirebase();
-    }
+    if (liveActive) pushLiveLatestSnapshotFirebase();
 
     // 6) Background codes refresh
     maybeFetchAccessCodesSafelyFirebase();
@@ -555,9 +581,7 @@ String getUserNameFromCache(const String& code) {
 
   FirebaseJsonData data;
   if (json.get(data, code)) {
-    if (data.typeNum == FirebaseJson::JSON_STRING && data.stringValue.length() > 0) {
-      return data.stringValue;
-    }
+    if (data.typeNum == FirebaseJson::JSON_STRING && data.stringValue.length() > 0) return data.stringValue;
   }
   return "Unknown";
 }
@@ -630,7 +654,6 @@ void setup() {
     return;
   }
 
-  // sensor pointer
   gSensor = esp_camera_sensor_get();
 
 #if defined(CAMERA_MODEL_ESP32S3_EYE)
@@ -655,7 +678,7 @@ void setup() {
 
   // ---------------- Start camera server (LAN debug)
   startCameraServer();
-  Serial.print("Stream URL (LAN debug): http://");
+  Serial.print("Stream URL (LAN): http://");
   Serial.print(WiFi.localIP());
   Serial.println(":81/stream");
 
@@ -766,7 +789,6 @@ void loop() {
       break;
     }
 
-    // digit
     inputCode += key;
     Serial.print("Current buffer: ");
     Serial.println(inputCode);
