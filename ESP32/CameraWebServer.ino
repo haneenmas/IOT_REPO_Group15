@@ -12,6 +12,11 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 
+// ===== Audio (MAX98357A) =====
+#include "FS.h"
+#include "LittleFS.h"
+#include "driver/i2s.h"
+
 // ===================
 // Select camera model
 // ===================
@@ -29,6 +34,7 @@ const char* password = "0522441867";
 // ===========================
 #define API_KEY "AIzaSyAZZFAOF2lEXONTwvi1iNaMZvJiPETzlpE"
 #define DATABASE_URL "iot15-46c28-default-rtdb.firebaseio.com"
+
 // ===========================
 // Keypad setup
 // ===========================
@@ -136,40 +142,80 @@ typedef struct {
 // Camera sensor pointer + profiles
 // ===========================
 sensor_t* gSensor = nullptr;
-
-// startCameraServer() is in app_httpd.cpp
 void startCameraServer();
 
 // ===========================
-// ✅ NEW: LAN publish state
+// ✅ LAN publish state
 // ===========================
 String lastPublishedIp = "";
 unsigned long lastLanPublishMs = 0;
-const unsigned long LAN_PUBLISH_MS = 30000; // publish at boot + every 30s (or when IP changes)
+const unsigned long LAN_PUBLISH_MS = 30000;
 
 // ===========================
-// ✅ NEW: adaptive live clarity
+// ✅ adaptive live clarity
 // ===========================
-unsigned long forceSmallLiveUntil = 0; // if live fails, force small profile for some time
+unsigned long forceSmallLiveUntil = 0;
 
 // ---------- Camera profiles ----------
 void setCameraProfileLiveSmall() {
   if (!gSensor) return;
   gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120
-  gSensor->set_quality(gSensor, 22);                // smaller file
+  gSensor->set_quality(gSensor, 22);
 }
 
 void setCameraProfileLiveClear() {
   if (!gSensor) return;
-  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240 (clearer)
-  gSensor->set_quality(gSensor, 16);                // clearer but larger
+  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240
+  gSensor->set_quality(gSensor, 16);
 }
 
 void setCameraProfileRing() {
   if (!gSensor) return;
-  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240
-  gSensor->set_quality(gSensor, 18);                // stable size
+  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);
+  gSensor->set_quality(gSensor, 18);
 }
+
+// =====================================================
+// ===== AUDIO forward declarations =====
+// =====================================================
+static void i2sInitOnce();
+static void testBeep();
+static bool readWavHeader(File& f, uint32_t& sampleRate, uint16_t& channels, uint16_t& bitsPerSample, uint32_t& dataStart, uint32_t& dataSize);
+static void playWavFile(const char* path, int vol0_10);
+
+// =====================================================
+// ===== AUDIO (MAX98357A) - LittleFS =====
+// =====================================================
+// Wiring:
+#define I2S_BCLK_PIN 39
+#define I2S_LRC_PIN  40
+#define I2S_DOUT_PIN 38
+
+static const char* FB_AUDIO_COMMAND  = "/audio/command";
+static const char* FB_AUDIO_ACTIVE   = "/audio/active";
+static const char* FB_AUDIO_VOLUME   = "/audio/volume";
+static const char* FB_AUDIO_MESSAGES = "/audio/messages";
+
+volatile bool audioActive = false;
+volatile int  audioVolume = 10; // 0..10
+
+unsigned long lastAudioPoll = 0;
+const unsigned long AUDIO_POLL_MS_ACTIVE = 400;
+const unsigned long AUDIO_POLL_MS_IDLE   = 4000;
+
+// audio worker queue
+typedef struct {
+  char file[64];   // "/LeavePackage.wav"
+  int volume;      // 0..10
+  bool stop;       // true = stop
+} AudioJob;
+
+static QueueHandle_t audioQueue;
+static TaskHandle_t  audioTaskHandle = nullptr;
+static volatile bool audioStopFlag = false;
+
+// allow pressing same command again because we reset Firebase to NONE
+static String lastAudioCommand = "NONE";
 
 // =====================================================
 // Button ISR
@@ -219,7 +265,6 @@ void setDoorCommandNoneFirebase() {
   if (Firebase.ready()) Firebase.RTDB.setString(&fbdo, "/door_command", "NONE");
 }
 
-// ✅ NEW: publish LAN stream URL to Firebase
 void publishLanInfoFirebase(bool force = false) {
   if (!Firebase.ready()) return;
 
@@ -299,14 +344,12 @@ bool setJSONWithRetry(const char* path, FirebaseJson& json, int tries = 3) {
 }
 
 // =====================================================
-// Snapshot -> Base64 (Firebase task only) + size prints
+// Snapshot -> Base64 (Firebase task only)
 // =====================================================
 String captureJpegToBase64() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { Serial.println("Snapshot failed: fb null"); return ""; }
   if (fb->format != PIXFORMAT_JPEG) { Serial.println("Snapshot not JPEG"); esp_camera_fb_return(fb); return ""; }
-
-  Serial.print("JPEG bytes: "); Serial.println(fb->len);
 
   size_t outLen = 0;
   size_t maxOut = 4 * ((fb->len + 2) / 3) + 1;
@@ -323,17 +366,12 @@ String captureJpegToBase64() {
 
   if (ret != 0) { Serial.println("base64 encode failed"); free(outBuf); return ""; }
 
-  Serial.print("B64 bytes: "); Serial.println((int)outLen);
-
   outBuf[outLen] = '\0';
   String b64 = String((char*)outBuf);
   free(outBuf);
   return b64;
 }
 
-// =====================================================
-// History helpers (Firebase task)
-// =====================================================
 void pushHistoryEventFirebase(const String& action, const String& by, const String& snapshotKey) {
   if (!Firebase.ready()) return;
 
@@ -387,7 +425,7 @@ void handleDoorbellEventFirebase() {
 }
 
 // =====================================================
-// Live latest snapshot (Firebase task): clearer when possible
+// Live latest snapshot (Firebase task)
 // =====================================================
 void pushLiveLatestSnapshotFirebase() {
   if (!Firebase.ready()) return;
@@ -403,7 +441,6 @@ void pushLiveLatestSnapshotFirebase() {
   if (millis() - lastLiveSnapMs < intervalMs) return;
   lastLiveSnapMs = millis();
 
-  // ✅ clearer when fps is low and no recent failures
   bool forceSmall = (millis() < forceSmallLiveUntil);
   if (!forceSmall && fpsLocal <= 1) setCameraProfileLiveClear();
   else setCameraProfileLiveSmall();
@@ -417,11 +454,6 @@ void pushLiveLatestSnapshotFirebase() {
   live.set("image", b64);
 
   if (!setJSONWithRetry("/live/latest", live, 2)) {
-    Serial.print("WiFi="); Serial.print(WiFi.status());
-    Serial.print(" RSSI="); Serial.print(WiFi.RSSI());
-    Serial.print(" Heap="); Serial.println(ESP.getFreeHeap());
-
-    // ✅ if it fails, force small live for 60 seconds
     forceSmallLiveUntil = millis() + 60000;
     liveBackoffUntil = millis() + 3000;
   }
@@ -479,11 +511,330 @@ void maybeFetchAccessCodesSafelyFirebase() {
 }
 
 // =====================================================
+// ===== AUDIO implementation =====
+// =====================================================
+static void i2sInitOnce() {
+  static bool inited = false;
+  if (inited) return;
+  inited = true;
+
+  i2s_config_t i2s_config = {};
+  i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  i2s_config.sample_rate = 16000;
+  i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+
+  // ✅ Most compatible: stereo frames
+  i2s_config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+
+  i2s_config.intr_alloc_flags = 0;
+  i2s_config.dma_buf_count = 8;
+  i2s_config.dma_buf_len = 256;
+  i2s_config.use_apll = false;
+  i2s_config.tx_desc_auto_clear = true;
+  i2s_config.fixed_mclk = 0;
+
+  i2s_pin_config_t pin_config = {};
+  pin_config.bck_io_num = I2S_BCLK_PIN;
+  pin_config.ws_io_num = I2S_LRC_PIN;
+  pin_config.data_out_num = I2S_DOUT_PIN;
+  pin_config.data_in_num = I2S_PIN_NO_CHANGE;
+
+  esp_err_t e1 = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  esp_err_t e2 = i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  Serial.print("✅ I2S init: install=");
+  Serial.print((int)e1);
+  Serial.print(" set_pin=");
+  Serial.println((int)e2);
+}
+
+static void testBeep() {
+  i2sInitOnce();
+
+  // stereo
+  i2s_set_clk(I2S_NUM_0, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+  Serial.println("🔊 Beep test start (should hear a loud beep)");
+  const int N = 16000; // 1 sec
+
+  for (int i = 0; i < N; i++) {
+    int16_t s = (i % 80 < 40) ? 16000 : -16000; // square wave
+    int16_t frame[2] = { s, s };               // L,R same
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, (const char*)frame, sizeof(frame), &written, portMAX_DELAY);
+  }
+
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  Serial.println("🔊 Beep test done");
+}
+
+static inline int16_t applyVol(int16_t s, int vol0_10) {
+  if (vol0_10 < 0) vol0_10 = 0;
+  if (vol0_10 > 10) vol0_10 = 10;
+  int32_t v = (int32_t)s * vol0_10;
+  v /= 10;
+  if (v > 32767) v = 32767;
+  if (v < -32768) v = -32768;
+  return (int16_t)v;
+}
+
+static bool readWavHeader(File& f, uint32_t& sampleRate, uint16_t& channels, uint16_t& bitsPerSample, uint32_t& dataStart, uint32_t& dataSize) {
+  if (f.size() < 44) return false;
+
+  auto rd32 = [&](uint32_t& v)->bool {
+    uint8_t b[4];
+    if (f.read(b, 4) != 4) return false;
+    v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return true;
+  };
+  auto rd16 = [&](uint16_t& v)->bool {
+    uint8_t b[2];
+    if (f.read(b, 2) != 2) return false;
+    v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+    return true;
+  };
+
+  char riff[4];
+  if (f.read((uint8_t*)riff, 4) != 4) return false;
+  if (memcmp(riff, "RIFF", 4) != 0) return false;
+
+  uint32_t riffSize;
+  if (!rd32(riffSize)) return false;
+
+  char wave[4];
+  if (f.read((uint8_t*)wave, 4) != 4) return false;
+  if (memcmp(wave, "WAVE", 4) != 0) return false;
+
+  bool gotFmt = false;
+  bool gotData = false;
+
+  while (f.position() + 8 <= (size_t)f.size()) {
+    char id[4];
+    if (f.read((uint8_t*)id, 4) != 4) return false;
+    uint32_t chunkSize;
+    if (!rd32(chunkSize)) return false;
+
+    uint32_t chunkStart = f.position();
+
+    if (memcmp(id, "fmt ", 4) == 0) {
+      uint16_t audioFormat;
+      if (!rd16(audioFormat)) return false;
+      if (!rd16(channels)) return false;
+      if (!rd32(sampleRate)) return false;
+
+      uint32_t byteRate;
+      uint16_t blockAlign;
+      if (!rd32(byteRate)) return false;
+      if (!rd16(blockAlign)) return false;
+      if (!rd16(bitsPerSample)) return false;
+
+      if (chunkSize > 16) f.seek(chunkStart + chunkSize);
+
+      if (audioFormat != 1) return false; // PCM only
+      gotFmt = true;
+    } else if (memcmp(id, "data", 4) == 0) {
+      dataStart = f.position();
+      dataSize = chunkSize;
+      f.seek(dataStart);
+      gotData = true;
+      break;
+    } else {
+      f.seek(chunkStart + chunkSize);
+    }
+  }
+
+  return gotFmt && gotData;
+}
+
+static void playWavFile(const char* path, int vol0_10) {
+  i2sInitOnce();
+
+  if (!LittleFS.exists(path)) {
+    Serial.print("❌ WAV not found: ");
+    Serial.println(path);
+    return;
+  }
+
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    Serial.print("❌ Failed to open WAV: ");
+    Serial.println(path);
+    return;
+  }
+
+  uint32_t sampleRate = 0, dataStart = 0, dataSize = 0;
+  uint16_t channels = 0, bits = 0;
+
+  if (!readWavHeader(f, sampleRate, channels, bits, dataStart, dataSize)) {
+    Serial.print("❌ Bad WAV header: ");
+    Serial.println(path);
+    f.close();
+    return;
+  }
+
+  if (bits != 16) {
+    Serial.println("❌ Only 16-bit PCM supported.");
+    f.close();
+    return;
+  }
+
+  if (channels != 1) {
+    Serial.println("❌ For now use MONO WAV (1 channel).");
+    f.close();
+    return;
+  }
+
+  if (vol0_10 < 0) vol0_10 = 0;
+  if (vol0_10 > 10) vol0_10 = 10;
+
+  // stereo output
+  i2s_set_clk(I2S_NUM_0, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+  Serial.print("▶️ Playing ");
+  Serial.print(path);
+  Serial.print(" SR=");
+  Serial.print(sampleRate);
+  Serial.print(" ch=");
+  Serial.print(channels);
+  Serial.print(" vol=");
+  Serial.println(vol0_10);
+
+  const size_t INBUF = 1024;
+  uint8_t in[INBUF];
+
+  // out stereo frames: each mono sample becomes 2 samples (L,R)
+  static int16_t out[INBUF]; // INBUF bytes -> INBUF/2 samples -> out needs 2x samples => INBUF int16 is enough
+
+  size_t bytesLeft = dataSize;
+  audioStopFlag = false;
+
+  while (bytesLeft > 0 && !audioStopFlag) {
+    size_t toRead = (bytesLeft > INBUF) ? INBUF : bytesLeft;
+    int r = f.read(in, toRead);
+    if (r <= 0) break;
+    bytesLeft -= (size_t)r;
+
+    int outIdx = 0;
+    for (int i = 0; i + 1 < r; i += 2) {
+      int16_t s = (int16_t)(in[i] | (in[i + 1] << 8));
+      s = applyVol(s, vol0_10);
+
+      // duplicate to stereo
+      out[outIdx++] = s;
+      out[outIdx++] = s;
+    }
+
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, (const char*)out, outIdx * sizeof(int16_t), &written, portMAX_DELAY);
+  }
+
+  f.close();
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  if (audioStopFlag) Serial.println("⏹️ Audio stopped");
+  else Serial.println("✅ Audio finished");
+}
+
+static void audioTask(void* pv) {
+  (void)pv;
+  AudioJob job{};
+  for (;;) {
+    if (xQueueReceive(audioQueue, &job, portMAX_DELAY) == pdTRUE) {
+      if (job.stop) {
+        audioStopFlag = true;
+        continue;
+      }
+      playWavFile(job.file, job.volume);
+    }
+  }
+}
+
+static void requestPlay(const String& filePath, int vol0_10) {
+  AudioJob j{};
+  strncpy(j.file, filePath.c_str(), sizeof(j.file) - 1);
+  j.volume = vol0_10;
+  j.stop = false;
+  xQueueSend(audioQueue, &j, 0);
+}
+
+static void requestStop() {
+  AudioJob j{};
+  j.stop = true;
+  xQueueSend(audioQueue, &j, 0);
+}
+
+static void pollAudioFirebase() {
+  if (!Firebase.ready()) return;
+
+  unsigned long pollMs = audioActive ? AUDIO_POLL_MS_ACTIVE : AUDIO_POLL_MS_IDLE;
+  if (millis() - lastAudioPoll < pollMs) return;
+  lastAudioPoll = millis();
+
+  // active gate
+  if (Firebase.RTDB.getBool(&fbdo, FB_AUDIO_ACTIVE)) audioActive = fbdo.boolData();
+
+  // volume
+  if (Firebase.RTDB.getInt(&fbdo, FB_AUDIO_VOLUME)) {
+    int v = fbdo.intData();
+    if (v < 0) v = 0;
+    if (v > 10) v = 10;
+    audioVolume = v;
+  }
+
+  if (!Firebase.RTDB.getString(&fbdo, FB_AUDIO_COMMAND)) return;
+  String cmd = fbdo.stringData();
+  cmd.trim();
+  if (cmd.length() == 0) cmd = "NONE";
+
+  if (cmd == "NONE") return;
+
+  // Always reset so user can press same again
+  Firebase.RTDB.setString(&fbdo, FB_AUDIO_COMMAND, "NONE");
+
+  if (cmd == "STOP") {
+    requestStop();
+    return;
+  }
+
+  // Debug command
+  if (cmd == "BEEP") {
+    testBeep();
+    return;
+  }
+
+  // Message key
+  String base = String(FB_AUDIO_MESSAGES) + "/" + cmd;
+
+  bool enabled = false;
+  if (Firebase.RTDB.getBool(&fbdo, (base + "/enabled").c_str())) enabled = fbdo.boolData();
+  if (!enabled) {
+    Serial.println("Audio message disabled: " + cmd);
+    return;
+  }
+
+  String filePath;
+  if (Firebase.RTDB.getString(&fbdo, (base + "/file").c_str())) filePath = fbdo.stringData();
+  filePath.trim();
+
+  if (filePath.length() == 0) {
+    Serial.println("Audio message empty file: " + cmd);
+    return;
+  }
+
+  requestStop();
+  vTaskDelay(pdMS_TO_TICKS(30));
+  requestPlay(filePath, audioVolume);
+
+  pushHistoryEventFirebase("play_audio", "Homeowner", "");
+}
+
+// =====================================================
 // Firebase Task
 // =====================================================
 void firebaseTask(void* pv) {
   (void)pv;
-
   bool didInitNodes = false;
 
   for (;;) {
@@ -496,14 +847,15 @@ void firebaseTask(void* pv) {
       updateDoorStatusFirebase("Closed");
       codesRefreshRequested = true;
 
-      // ✅ publish LAN info immediately when Firebase ready
+      Firebase.RTDB.setString(&fbdo, "/audio/command", "NONE");
+      Firebase.RTDB.setBool(&fbdo, "/audio/active", false);
+      if (!Firebase.RTDB.getInt(&fbdo, "/audio/volume")) Firebase.RTDB.setInt(&fbdo, "/audio/volume", 10);
+
       publishLanInfoFirebase(true);
     }
 
-    // ✅ publish LAN info periodically (or if IP changes)
     if (Firebase.ready()) publishLanInfoFirebase(false);
 
-    // 1) Ring event
     if (ringRequested) {
       ringRequested = false;
       ringInProgress = true;
@@ -511,11 +863,9 @@ void firebaseTask(void* pv) {
       ringInProgress = false;
     }
 
-    // 2) Process unlock queue
     UnlockEvent ev;
     while (xQueueReceive(unlockQueue, &ev, 0) == pdTRUE) {
       pushHistoryEventFirebase("unlock", String(ev.user), "");
-
       if (ev.isOtp) {
         Serial.println("One-Time Code used. Deleting...");
         String path = String("/access_codes/") + String(ev.code);
@@ -524,27 +874,23 @@ void firebaseTask(void* pv) {
       }
     }
 
-    // 3) Update door status if dirty
     if (doorStatusDirty && Firebase.ready()) {
       doorStatusDirty = false;
-
       bool openLocal;
       xSemaphoreTake(doorMutex, portMAX_DELAY);
       openLocal = isDoorOpen;
       xSemaphoreGive(doorMutex);
-
       updateDoorStatusFirebase(openLocal ? "Open" : "Closed");
     }
 
-    // 4) Poll commands/live settings
     pollRemoteCommandFirebase();
     pollLiveSettingsFirebase();
 
-    // 5) Live snapshots
     if (liveActive) pushLiveLatestSnapshotFirebase();
 
-    // 6) Background codes refresh
     maybeFetchAccessCodesSafelyFirebase();
+
+    pollAudioFirebase();
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -591,7 +937,6 @@ String getUserNameFromCache(const String& code) {
 // =====================================================
 void setup() {
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
   Serial.println();
 
   pinMode(LED_PIN, OUTPUT);
@@ -603,6 +948,28 @@ void setup() {
   doorMutex = xSemaphoreCreateMutex();
   codesMutex = xSemaphoreCreateMutex();
   unlockQueue = xQueueCreate(8, sizeof(UnlockEvent));
+
+  audioQueue = xQueueCreate(4, sizeof(AudioJob));
+  xTaskCreatePinnedToCore(audioTask, "audioTask", 8192, nullptr, 1, &audioTaskHandle, 0);
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("❌ LittleFS init failed");
+  } else {
+    Serial.println("✅ LittleFS ready");
+    File root = LittleFS.open("/");
+    File file = root.openNextFile();
+    while (file) {
+      Serial.print(" - ");
+      Serial.print(file.name());
+      Serial.print(" (");
+      Serial.print(file.size());
+      Serial.println(" bytes)");
+      file = root.openNextFile();
+    }
+  }
+
+  // ✅ beep immediately at boot
+  testBeep();
 
   // ---------------- Camera init
   camera_config_t config;
@@ -660,7 +1027,6 @@ void setup() {
   if (gSensor) gSensor->set_vflip(gSensor, 1);
 #endif
 
-  // default to ring profile
   setCameraProfileRing();
 
   // ---------------- WiFi
@@ -676,7 +1042,6 @@ void setup() {
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 
-  // ---------------- Start camera server (LAN debug)
   startCameraServer();
   Serial.print("Stream URL (LAN): http://");
   Serial.print(WiFi.localIP());
@@ -696,7 +1061,6 @@ void setup() {
   doorStatusDirty = true;
   lastUserActionMs = millis();
 
-  // Create Firebase task pinned to core 1
   xTaskCreatePinnedToCore(
     firebaseTask,
     "firebaseTask",
@@ -714,7 +1078,6 @@ void setup() {
 String inputCode = "";
 
 void loop() {
-  // 1) Handle all ISR button presses safely (debounced count)
   static uint16_t lastHandled = 0;
   uint16_t cur = btnIsrCount;
 
@@ -732,7 +1095,6 @@ void loop() {
     }
   }
 
-  // 2) Apply remote command locally
   DoorCmd cmd = pendingDoorCmd;
   if (cmd != DC_NONE) {
     pendingDoorCmd = DC_NONE;
@@ -740,31 +1102,22 @@ void loop() {
     else if (cmd == DC_UNLOCK) unlockDoorLocal();
   }
 
-  // 3) Keypad read + Serial prints
   char key;
   while ((key = keypad.getKey())) {
     lastUserActionMs = millis();
 
-    Serial.print("Keypad pressed: ");
-    Serial.println(key);
-
     if (key == '#') {
-      Serial.print("Entered code: ");
-      Serial.println(inputCode);
-
       if (inputCode.length() < 4) {
-        Serial.println("Too short ❌");
         blinkErrorLocal();
         inputCode = "";
         break;
       }
 
       if (millis() - lastCodesFetchMs > CODES_MAX_AGE_BEFORE_UNLOCK_MS) {
-        codesRefreshRequested = true; // background refresh
+        codesRefreshRequested = true;
       }
 
       if (codeExistsInCache(inputCode)) {
-        Serial.println("ACCESS GRANTED ✅");
         String userName = getUserNameFromCache(inputCode);
         unlockDoorLocal();
 
@@ -774,7 +1127,6 @@ void loop() {
         ev.isOtp = (userName == "OTP_Visitor");
         xQueueSend(unlockQueue, &ev, 0);
       } else {
-        Serial.println("ACCESS DENIED ❌");
         blinkErrorLocal();
       }
 
@@ -783,24 +1135,18 @@ void loop() {
     }
 
     if (key == '*') {
-      Serial.println("Entry cleared (*)");
       if (isDoorOpen) lockDoorLocal();
       inputCode = "";
       break;
     }
 
     inputCode += key;
-    Serial.print("Current buffer: ");
-    Serial.println(inputCode);
-
     if (inputCode.length() > 10) {
-      Serial.println("Buffer too long -> cleared");
       inputCode = "";
       blinkErrorLocal();
     }
   }
 
-  // 4) Auto-relock
   bool openLocal;
   unsigned long openTimeLocal;
   xSemaphoreTake(doorMutex, portMAX_DELAY);
@@ -809,7 +1155,6 @@ void loop() {
   xSemaphoreGive(doorMutex);
 
   if (openLocal && (millis() - openTimeLocal >= AUTO_LOCK_DELAY)) {
-    Serial.println("Auto-Relock triggered.");
     lockDoorLocal();
   }
 
