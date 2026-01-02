@@ -95,6 +95,18 @@ const unsigned long CODES_MAX_AGE_BEFORE_UNLOCK_MS = 10000; // 10 seconds
 volatile bool codesRefreshRequested = false;
 
 // ===========================
+// ✅ Security: PIN lockout after 5 failures (1 minute)
+// ===========================
+static uint8_t wrongAttempts = 0;
+static unsigned long lockoutUntilMs = 0;
+
+const uint8_t MAX_WRONG_ATTEMPTS = 5;
+const unsigned long LOCKOUT_MS = 60000; // 1 minute
+
+static volatile bool lockoutEventPending = false;  // Firebase task will log this
+static volatile uint8_t lockoutEventAttempts = 0;
+
+// ===========================
 // Live mode variables
 // ===========================
 volatile bool liveActive = false;
@@ -176,6 +188,53 @@ void setCameraProfileRing() {
 }
 
 // =====================================================
+// ===== OFFLINE cache (LittleFS) =====
+// =====================================================
+static const char* CODES_FILE = "/codes_cache.json";
+
+void saveCodesCacheToFS(const String& json) {
+  File f = LittleFS.open(CODES_FILE, "w");
+  if (!f) {
+    Serial.println("❌ Failed to open codes cache file for writing");
+    return;
+  }
+  f.print(json);
+  f.close();
+  Serial.println("✅ Codes cache saved to LittleFS");
+}
+
+bool loadCodesCacheFromFS() {
+  if (!LittleFS.exists(CODES_FILE)) {
+    Serial.println("ℹ️ No codes cache file in LittleFS yet");
+    return false;
+  }
+
+  File f = LittleFS.open(CODES_FILE, "r");
+  if (!f) {
+    Serial.println("❌ Failed to open codes cache file for reading");
+    return false;
+  }
+
+  String json = f.readString();
+  f.close();
+
+  if (json.length() < 2) {
+    Serial.println("❌ Codes cache file is empty/bad");
+    return false;
+  }
+
+  xSemaphoreTake(codesMutex, portMAX_DELAY);
+  validCodesJson = json;
+  xSemaphoreGive(codesMutex);
+
+  // Treat as "fresh enough" for offline usage
+  lastCodesFetchMs = millis();
+
+  Serial.println("✅ Codes cache loaded from LittleFS (offline mode ready)");
+  return true;
+}
+
+// =====================================================
 // ===== AUDIO forward declarations =====
 // =====================================================
 static void i2sInitOnce();
@@ -214,9 +273,6 @@ static QueueHandle_t audioQueue;
 static TaskHandle_t  audioTaskHandle = nullptr;
 static volatile bool audioStopFlag = false;
 
-// allow pressing same command again because we reset Firebase to NONE
-static String lastAudioCommand = "NONE";
-
 // =====================================================
 // Button ISR
 // =====================================================
@@ -252,6 +308,7 @@ void blinkErrorLocal() {
     digitalWrite(LED_PIN, HIGH); delay(60);
     digitalWrite(LED_PIN, LOW);  delay(60);
   }
+  testBeep();
 }
 
 // =====================================================
@@ -323,6 +380,9 @@ void fetchAccessCodesFirebase() {
     validCodesJson = json;
     xSemaphoreGive(codesMutex);
 
+    // ✅ offline persistence
+    saveCodesCacheToFS(json);
+
     lastCodesFetchMs = millis();
     Serial.println("Success! List updated.");
   } else {
@@ -390,7 +450,7 @@ void pushHistoryEventFirebase(const String& action, const String& by, const Stri
 // =====================================================
 void handleDoorbellEventFirebase() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected -> doorbell event skipped");
+    Serial.println("WiFi not connected -> doorbell event skipped (offline)");
     return;
   }
 
@@ -552,22 +612,17 @@ static void i2sInitOnce() {
 
 static void testBeep() {
   i2sInitOnce();
-
-  // stereo
   i2s_set_clk(I2S_NUM_0, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
 
-  Serial.println("🔊 Beep test start (should hear a loud beep)");
-  const int N = 16000; // 1 sec
-
+  const int N = 8000; // 0.5 sec
   for (int i = 0; i < N; i++) {
-    int16_t s = (i % 80 < 40) ? 16000 : -16000; // square wave
-    int16_t frame[2] = { s, s };               // L,R same
+    int16_t s = (i % 80 < 40) ? 16000 : -16000;
+    int16_t frame[2] = { s, s };
     size_t written = 0;
     i2s_write(I2S_NUM_0, (const char*)frame, sizeof(frame), &written, portMAX_DELAY);
   }
 
   i2s_zero_dma_buffer(I2S_NUM_0);
-  Serial.println("🔊 Beep test done");
 }
 
 static inline int16_t applyVol(int16_t s, int vol0_10) {
@@ -674,14 +729,8 @@ static void playWavFile(const char* path, int vol0_10) {
     return;
   }
 
-  if (bits != 16) {
-    Serial.println("❌ Only 16-bit PCM supported.");
-    f.close();
-    return;
-  }
-
-  if (channels != 1) {
-    Serial.println("❌ For now use MONO WAV (1 channel).");
+  if (bits != 16 || channels != 1) {
+    Serial.println("❌ Use 16-bit MONO PCM WAV.");
     f.close();
     return;
   }
@@ -689,23 +738,18 @@ static void playWavFile(const char* path, int vol0_10) {
   if (vol0_10 < 0) vol0_10 = 0;
   if (vol0_10 > 10) vol0_10 = 10;
 
-  // stereo output
   i2s_set_clk(I2S_NUM_0, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
 
   Serial.print("▶️ Playing ");
   Serial.print(path);
   Serial.print(" SR=");
   Serial.print(sampleRate);
-  Serial.print(" ch=");
-  Serial.print(channels);
   Serial.print(" vol=");
   Serial.println(vol0_10);
 
   const size_t INBUF = 1024;
   uint8_t in[INBUF];
-
-  // out stereo frames: each mono sample becomes 2 samples (L,R)
-  static int16_t out[INBUF]; // INBUF bytes -> INBUF/2 samples -> out needs 2x samples => INBUF int16 is enough
+  static int16_t out[INBUF];
 
   size_t bytesLeft = dataSize;
   audioStopFlag = false;
@@ -720,10 +764,8 @@ static void playWavFile(const char* path, int vol0_10) {
     for (int i = 0; i + 1 < r; i += 2) {
       int16_t s = (int16_t)(in[i] | (in[i + 1] << 8));
       s = applyVol(s, vol0_10);
-
-      // duplicate to stereo
-      out[outIdx++] = s;
-      out[outIdx++] = s;
+      out[outIdx++] = s; // L
+      out[outIdx++] = s; // R
     }
 
     size_t written = 0;
@@ -772,10 +814,8 @@ static void pollAudioFirebase() {
   if (millis() - lastAudioPoll < pollMs) return;
   lastAudioPoll = millis();
 
-  // active gate
   if (Firebase.RTDB.getBool(&fbdo, FB_AUDIO_ACTIVE)) audioActive = fbdo.boolData();
 
-  // volume
   if (Firebase.RTDB.getInt(&fbdo, FB_AUDIO_VOLUME)) {
     int v = fbdo.intData();
     if (v < 0) v = 0;
@@ -790,7 +830,7 @@ static void pollAudioFirebase() {
 
   if (cmd == "NONE") return;
 
-  // Always reset so user can press same again
+  // Always reset so user can press again
   Firebase.RTDB.setString(&fbdo, FB_AUDIO_COMMAND, "NONE");
 
   if (cmd == "STOP") {
@@ -798,13 +838,11 @@ static void pollAudioFirebase() {
     return;
   }
 
-  // Debug command
   if (cmd == "BEEP") {
     testBeep();
     return;
   }
 
-  // Message key
   String base = String(FB_AUDIO_MESSAGES) + "/" + cmd;
 
   bool enabled = false;
@@ -855,6 +893,20 @@ void firebaseTask(void* pv) {
     }
 
     if (Firebase.ready()) publishLanInfoFirebase(false);
+
+    // ✅ log PIN lockout event (online)
+    if (lockoutEventPending && Firebase.ready()) {
+      lockoutEventPending = false;
+
+      FirebaseJson j;
+      j.set("attempts", (int)lockoutEventAttempts);
+      j.set("duration_ms", (int)LOCKOUT_MS);
+      j.set("ts/.sv", "timestamp");
+      Firebase.RTDB.setJSON(&fbdo, "/security/lockout", &j);
+
+      pushHistoryEventFirebase("pin_lockout", "Security", "");
+      Serial.println("✅ Logged pin_lockout to Firebase history");
+    }
 
     if (ringRequested) {
       ringRequested = false;
@@ -956,6 +1008,8 @@ void setup() {
     Serial.println("❌ LittleFS init failed");
   } else {
     Serial.println("✅ LittleFS ready");
+
+    // list files
     File root = LittleFS.open("/");
     File file = root.openNextFile();
     while (file) {
@@ -966,10 +1020,10 @@ void setup() {
       Serial.println(" bytes)");
       file = root.openNextFile();
     }
-  }
 
-  // ✅ beep immediately at boot
-  testBeep();
+    // ✅ offline: load last known codes
+    loadCodesCacheFromFS();
+  }
 
   // ---------------- Camera init
   camera_config_t config;
@@ -1022,54 +1076,62 @@ void setup() {
   }
 
   gSensor = esp_camera_sensor_get();
-
 #if defined(CAMERA_MODEL_ESP32S3_EYE)
   if (gSensor) gSensor->set_vflip(gSensor, 1);
 #endif
-
   setCameraProfileRing();
 
-  // ---------------- WiFi
+  // ---------------- WiFi (✅ timeout so we don't block offline mode)
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
 
   Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < 15000) {
     delay(250);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
 
-  startCameraServer();
-  Serial.print("Stream URL (LAN): http://");
-  Serial.print(WiFi.localIP());
-  Serial.println(":81/stream");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
 
-  // ---------------- Firebase init
-  fconfig.api_key = API_KEY;
-  fconfig.database_url = DATABASE_URL;
-  fconfig.signer.test_mode = true;
+    startCameraServer();
+    Serial.print("Stream URL (LAN): http://");
+    Serial.print(WiFi.localIP());
+    Serial.println(":81/stream");
 
-  fbdo.setBSSLBufferSize(16384, 16384);
-  fconfig.timeout.serverResponse = 15000;
+    // ---------------- Firebase init
+    fconfig.api_key = API_KEY;
+    fconfig.database_url = DATABASE_URL;
+    fconfig.signer.test_mode = true;
 
-  Firebase.begin(&fconfig, &auth);
-  Firebase.reconnectWiFi(true);
+    fbdo.setBSSLBufferSize(16384, 16384);
+    fconfig.timeout.serverResponse = 15000;
 
-  doorStatusDirty = true;
-  lastUserActionMs = millis();
+    Firebase.begin(&fconfig, &auth);
+    Firebase.reconnectWiFi(true);
 
-  xTaskCreatePinnedToCore(
-    firebaseTask,
-    "firebaseTask",
-    12288,
-    nullptr,
-    1,
-    nullptr,
-    1
-  );
+    // Create Firebase task pinned to core 1
+    xTaskCreatePinnedToCore(
+      firebaseTask,
+      "firebaseTask",
+      12288,
+      nullptr,
+      1,
+      nullptr,
+      1
+    );
+
+    doorStatusDirty = true;
+    lastUserActionMs = millis();
+    codesRefreshRequested = true; // refresh when idle
+
+  } else {
+    Serial.println("\n⚠️ WiFi NOT connected -> running OFFLINE MODE (keypad still works)");
+    Serial.println("ℹ️ Will retry WiFi in loop()");
+  }
 }
 
 // =====================================================
@@ -1078,6 +1140,16 @@ void setup() {
 String inputCode = "";
 
 void loop() {
+  // ✅ WiFi retry in background (offline mode)
+  static unsigned long lastWiFiRetryMs = 0;
+  if (WiFi.status() != WL_CONNECTED && (millis() - lastWiFiRetryMs) > 10000) {
+    lastWiFiRetryMs = millis();
+    Serial.println("🔄 Retrying WiFi...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+
+  // 1) Handle doorbell button presses (ISR count)
   static uint16_t lastHandled = 0;
   uint16_t cur = btnIsrCount;
 
@@ -1090,11 +1162,14 @@ void loop() {
       lastRingMs = nowMs;
       ringRequested = true;
       Serial.println("Doorbell button pressed! (queued)");
+      // offline feedback
+      if (WiFi.status() != WL_CONNECTED) testBeep();
     } else {
       Serial.println("Doorbell ignored (cooldown)");
     }
   }
 
+  // 2) Apply remote command locally
   DoorCmd cmd = pendingDoorCmd;
   if (cmd != DC_NONE) {
     pendingDoorCmd = DC_NONE;
@@ -1102,22 +1177,53 @@ void loop() {
     else if (cmd == DC_UNLOCK) unlockDoorLocal();
   }
 
+  // 3) Keypad read + Serial prints + lockout logic
+  static unsigned long lastLockoutPrintMs = 0;
+
   char key;
   while ((key = keypad.getKey())) {
     lastUserActionMs = millis();
 
+    Serial.print("Keypad pressed: ");
+    Serial.println(key);
+
+    // ✅ lockout active: disable PIN entry (allow '*' to clear buffer only)
+    if (millis() < lockoutUntilMs) {
+      if (millis() - lastLockoutPrintMs > 800) {
+        lastLockoutPrintMs = millis();
+        unsigned long left = (lockoutUntilMs - millis()) / 1000;
+        Serial.print("⛔ Keypad LOCKED. Wait ");
+        Serial.print(left);
+        Serial.println("s");
+      }
+
+      if (key == '*') {
+        inputCode = "";
+        Serial.println("Entry cleared (*) while locked");
+      }
+      continue; // ignore all other keys during lockout
+    }
+
     if (key == '#') {
+      Serial.print("Entered code: ");
+      Serial.println(inputCode);
+
       if (inputCode.length() < 4) {
+        Serial.println("Too short ❌");
         blinkErrorLocal();
         inputCode = "";
         break;
       }
 
+      // Ask Firebase to refresh later when online (doesn't block offline)
       if (millis() - lastCodesFetchMs > CODES_MAX_AGE_BEFORE_UNLOCK_MS) {
         codesRefreshRequested = true;
       }
 
       if (codeExistsInCache(inputCode)) {
+        Serial.println("ACCESS GRANTED ✅");
+        wrongAttempts = 0; // ✅ reset failures on success
+
         String userName = getUserNameFromCache(inputCode);
         unlockDoorLocal();
 
@@ -1126,8 +1232,28 @@ void loop() {
         strncpy(ev.user, userName.c_str(), sizeof(ev.user) - 1);
         ev.isOtp = (userName == "OTP_Visitor");
         xQueueSend(unlockQueue, &ev, 0);
+
       } else {
+        Serial.println("ACCESS DENIED ❌");
         blinkErrorLocal();
+
+        wrongAttempts++;
+        Serial.print("Wrong attempts: ");
+        Serial.println(wrongAttempts);
+
+        if (wrongAttempts >= MAX_WRONG_ATTEMPTS) {
+          wrongAttempts = 0;
+          lockoutUntilMs = millis() + LOCKOUT_MS;
+
+          Serial.println("⛔ LOCKOUT TRIGGERED (1 minute)");
+
+          // mark event for Firebase task to log when online
+          lockoutEventPending = true;
+          lockoutEventAttempts = MAX_WRONG_ATTEMPTS;
+
+          // extra feedback
+          testBeep();
+        }
       }
 
       inputCode = "";
@@ -1135,18 +1261,25 @@ void loop() {
     }
 
     if (key == '*') {
+      Serial.println("Entry cleared (*)");
       if (isDoorOpen) lockDoorLocal();
       inputCode = "";
       break;
     }
 
+    // digits
     inputCode += key;
+    Serial.print("Current buffer: ");
+    Serial.println(inputCode);
+
     if (inputCode.length() > 10) {
+      Serial.println("Buffer too long -> cleared");
       inputCode = "";
       blinkErrorLocal();
     }
   }
 
+  // 4) Auto-relock
   bool openLocal;
   unsigned long openTimeLocal;
   xSemaphoreTake(doorMutex, portMAX_DELAY);
@@ -1155,6 +1288,7 @@ void loop() {
   xSemaphoreGive(doorMutex);
 
   if (openLocal && (millis() - openTimeLocal >= AUTO_LOCK_DELAY)) {
+    Serial.println("Auto-Relock triggered.");
     lockDoorLocal();
   }
 
