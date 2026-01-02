@@ -171,15 +171,16 @@ unsigned long forceSmallLiveUntil = 0;
 // ---------- Camera profiles ----------
 void setCameraProfileLiveSmall() {
   if (!gSensor) return;
-  gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120
-  gSensor->set_quality(gSensor, 22);
+  gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120 (fast)
+  gSensor->set_quality(gSensor, 22);                // more compression (smaller)
 }
 
 void setCameraProfileLiveClear() {
   if (!gSensor) return;
-  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240
-  gSensor->set_quality(gSensor, 16);
+  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240 (clear)
+  gSensor->set_quality(gSensor, 10);                // ✅ clearer (bigger upload)
 }
+
 
 void setCameraProfileRing() {
   if (!gSensor) return;
@@ -190,18 +191,48 @@ void setCameraProfileRing() {
 // =====================================================
 // ===== OFFLINE cache (LittleFS) =====
 // =====================================================
-static const char* CODES_FILE = "/codes_cache.json";
+static const char* CODES_FILE = "/offline_codes.json";
 
 void saveCodesCacheToFS(const String& json) {
-  File f = LittleFS.open(CODES_FILE, "w");
-  if (!f) {
-    Serial.println("❌ Failed to open codes cache file for writing");
+  String s = json;
+  s.trim();
+
+  // ✅ Do NOT overwrite cache with empty/invalid Firebase returns
+  if (s.length() < 2 || s == "null" || s == "{}") {
+    Serial.print("⚠️ Not saving cache (invalid json): '");
+    Serial.print(s);
+    Serial.println("'");
     return;
   }
-  f.print(json);
+
+  File f = LittleFS.open(CODES_FILE, "w");
+  if (!f) {
+    Serial.println("❌ Failed to open offline_codes.json for writing");
+    return;
+  }
+
+  size_t written = f.print(s);
+  f.flush();
   f.close();
-  Serial.println("✅ Codes cache saved to LittleFS");
+
+  // ✅ verify by reopening
+  File v = LittleFS.open(CODES_FILE, "r");
+  size_t sz = v ? v.size() : 0;
+  String head = "";
+  if (v) {
+    head = v.readString().substring(0, 120);
+    v.close();
+  }
+
+  Serial.print("✅ Codes cache saved: wrote=");
+  Serial.print(written);
+  Serial.print(" bytes | file_size=");
+  Serial.println(sz);
+
+  Serial.print("📄 offline_codes.json preview: ");
+  Serial.println(head);
 }
+
 
 bool loadCodesCacheFromFS() {
   if (!LittleFS.exists(CODES_FILE)) {
@@ -256,7 +287,7 @@ static const char* FB_AUDIO_VOLUME   = "/audio/volume";
 static const char* FB_AUDIO_MESSAGES = "/audio/messages";
 
 volatile bool audioActive = false;
-volatile int  audioVolume = 10; // 0..10
+volatile int  audioVolume = 2; // 0..10
 
 unsigned long lastAudioPoll = 0;
 const unsigned long AUDIO_POLL_MS_ACTIVE = 400;
@@ -514,9 +545,12 @@ void pushLiveLatestSnapshotFirebase() {
   live.set("image", b64);
 
   if (!setJSONWithRetry("/live/latest", live, 2)) {
-    forceSmallLiveUntil = millis() + 60000;
-    liveBackoffUntil = millis() + 3000;
-  }
+  forceSmallLiveUntil = millis() + 10000; // ✅ only 10s small mode
+  liveBackoffUntil = millis() + 3000;
+} else {
+  forceSmallLiveUntil = 0; // ✅ go back to clear immediately
+}
+
 }
 
 // =====================================================
@@ -1208,12 +1242,13 @@ void loop() {
       Serial.print("Entered code: ");
       Serial.println(inputCode);
 
-      if (inputCode.length() < 4) {
-        Serial.println("Too short ❌");
-        blinkErrorLocal();
-        inputCode = "";
-        break;
-      }
+      //if (inputCode.length() < 4) {
+       // Serial.println("Too short ❌");
+       // wrongAttempts++;
+       // blinkErrorLocal();
+       // inputCode = "";
+       // break;
+     // }
 
       // Ask Firebase to refresh later when online (doesn't block offline)
       if (millis() - lastCodesFetchMs > CODES_MAX_AGE_BEFORE_UNLOCK_MS) {
@@ -1234,6 +1269,8 @@ void loop() {
         xQueueSend(unlockQueue, &ev, 0);
 
       } else {
+        // if (inputCode.length() < 4) 
+        Serial.println("Too short ❌");
         Serial.println("ACCESS DENIED ❌");
         blinkErrorLocal();
 
