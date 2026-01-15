@@ -1,3 +1,16 @@
+/************************************************************
+ * Smart Doorbell (ESP32-S3-EYE) - UPDATED
+ * ✅ Every physical doorbell press:
+ *   1) captures snapshot IMMEDIATELY (offline-safe) to LittleFS
+ *   2) queues upload to Firebase (snapshots + notification + history)
+ *   3) never "ignored (cooldown)" — NO cooldown drop
+ *
+ * Notes:
+ * - You MUST have your startCameraServer() implementation in another tab/file
+ *   (same as before).
+ * - If WiFi/Firebase is down, snapshot is still saved locally and upload is retried.
+ ************************************************************/
+
 #include "esp_camera.h"
 #include <WiFi.h>
 
@@ -46,7 +59,9 @@ char keys[ROWS][COLS] = {
   {'7','4','1','*'},
 };
 
-byte rowPins[ROWS] = {1, 2, 3}; 
+// ⚠️ On some ESP32-S3 boards GPIO1/2/3 are sensitive.
+// If you ever see boot/USB issues, tell me and I’ll give a safer pin set.
+byte rowPins[ROWS] = {1, 2, 3};
 byte colPins[COLS] = {14, 21, 48, 47};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
@@ -123,7 +138,7 @@ const unsigned long LIVE_POLL_MS = 800;
 unsigned long liveBackoffUntil = 0;
 
 // Pause live while ring upload is running
-volatile bool ringInProgress = false;
+static volatile bool ringInProgress = false;
 
 // ===========================
 // Remote command from Firebase -> applied locally
@@ -137,9 +152,6 @@ volatile DoorCmd pendingDoorCmd = DC_NONE;
 volatile uint16_t btnIsrCount = 0;
 volatile uint32_t lastBtnIsrUs = 0;
 const uint32_t BTN_BOUNCE_US = 80000; // 80ms ISR debounce
-unsigned long lastRingMs = 0;
-const unsigned long RING_COOLDOWN_MS = 3000;
-volatile bool ringRequested = false;
 
 // ===========================
 // Unlock event queue (main loop -> Firebase task)
@@ -154,7 +166,7 @@ typedef struct {
 // Camera sensor pointer + profiles
 // ===========================
 sensor_t* gSensor = nullptr;
-void startCameraServer();
+void startCameraServer(); // must exist in another file/tab
 
 // ===========================
 // ✅ LAN publish state
@@ -171,16 +183,15 @@ unsigned long forceSmallLiveUntil = 0;
 // ---------- Camera profiles ----------
 void setCameraProfileLiveSmall() {
   if (!gSensor) return;
-  gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120 (fast)
-  gSensor->set_quality(gSensor, 22);                // more compression (smaller)
+  gSensor->set_framesize(gSensor, FRAMESIZE_QQVGA); // 160x120
+  gSensor->set_quality(gSensor, 22);
 }
 
 void setCameraProfileLiveClear() {
   if (!gSensor) return;
-  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240 (clear)
-  gSensor->set_quality(gSensor, 10);                // ✅ clearer (bigger upload)
+  gSensor->set_framesize(gSensor, FRAMESIZE_QVGA);  // 320x240
+  gSensor->set_quality(gSensor, 10);
 }
-
 
 void setCameraProfileRing() {
   if (!gSensor) return;
@@ -196,8 +207,6 @@ static const char* CODES_FILE = "/offline_codes.json";
 void saveCodesCacheToFS(const String& json) {
   String s = json;
   s.trim();
-
-  // ✅ Do NOT overwrite cache with empty/invalid Firebase returns
   if (s.length() < 2 || s == "null" || s == "{}") {
     Serial.print("⚠️ Not saving cache (invalid json): '");
     Serial.print(s);
@@ -210,29 +219,22 @@ void saveCodesCacheToFS(const String& json) {
     Serial.println("❌ Failed to open offline_codes.json for writing");
     return;
   }
-
   size_t written = f.print(s);
   f.flush();
   f.close();
 
-  // ✅ verify by reopening
   File v = LittleFS.open(CODES_FILE, "r");
   size_t sz = v ? v.size() : 0;
   String head = "";
-  if (v) {
-    head = v.readString().substring(0, 120);
-    v.close();
-  }
+  if (v) { head = v.readString().substring(0, 120); v.close(); }
 
   Serial.print("✅ Codes cache saved: wrote=");
   Serial.print(written);
   Serial.print(" bytes | file_size=");
   Serial.println(sz);
-
   Serial.print("📄 offline_codes.json preview: ");
   Serial.println(head);
 }
-
 
 bool loadCodesCacheFromFS() {
   if (!LittleFS.exists(CODES_FILE)) {
@@ -258,9 +260,7 @@ bool loadCodesCacheFromFS() {
   validCodesJson = json;
   xSemaphoreGive(codesMutex);
 
-  // Treat as "fresh enough" for offline usage
   lastCodesFetchMs = millis();
-
   Serial.println("✅ Codes cache loaded from LittleFS (offline mode ready)");
   return true;
 }
@@ -276,7 +276,7 @@ static void playWavFile(const char* path, int vol0_10);
 // =====================================================
 // ===== AUDIO (MAX98357A) - LittleFS =====
 // =====================================================
-// Wiring:
+// Your chosen I2S pins:
 #define I2S_BCLK_PIN 36
 #define I2S_LRC_PIN  35
 #define I2S_DOUT_PIN 37
@@ -303,6 +303,16 @@ typedef struct {
 static QueueHandle_t audioQueue;
 static TaskHandle_t  audioTaskHandle = nullptr;
 static volatile bool audioStopFlag = false;
+
+// =====================================================
+// ✅ NEW: Ring snapshot queue (offline-safe)
+// =====================================================
+typedef struct {
+  char filePath[48];   // "/ring_123456.jpg"
+  uint32_t localMs;
+} RingJob;
+
+static QueueHandle_t ringQueue;
 
 // =====================================================
 // Button ISR
@@ -411,7 +421,6 @@ void fetchAccessCodesFirebase() {
     validCodesJson = json;
     xSemaphoreGive(codesMutex);
 
-    // ✅ offline persistence
     saveCodesCacheToFS(json);
 
     lastCodesFetchMs = millis();
@@ -424,7 +433,6 @@ void fetchAccessCodesFirebase() {
 bool setJSONWithRetry(const char* path, FirebaseJson& json, int tries = 3) {
   for (int i = 0; i < tries; i++) {
     if (WiFi.status() != WL_CONNECTED) return false;
-
     if (Firebase.RTDB.setJSON(&fbdo, path, &json)) return true;
 
     Serial.print("setJSON failed: ");
@@ -435,7 +443,7 @@ bool setJSONWithRetry(const char* path, FirebaseJson& json, int tries = 3) {
 }
 
 // =====================================================
-// Snapshot -> Base64 (Firebase task only)
+// Snapshot -> Base64 (for live)
 // =====================================================
 String captureJpegToBase64() {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -463,6 +471,52 @@ String captureJpegToBase64() {
   return b64;
 }
 
+// =====================================================
+// ✅ NEW: snapshot to file (offline safe, immediate)
+// =====================================================
+static bool captureJpegToFile(const char* path) {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("❌ Snapshot failed: fb null");
+    return false;
+  }
+  if (fb->format != PIXFORMAT_JPEG) {
+    Serial.println("❌ Snapshot failed: not JPEG");
+    esp_camera_fb_return(fb);
+    return false;
+  }
+
+  File f = LittleFS.open(path, "w");
+  if (!f) {
+    Serial.print("❌ Failed to open for write: ");
+    Serial.println(path);
+    esp_camera_fb_return(fb);
+    return false;
+  }
+
+  size_t written = f.write(fb->buf, fb->len);
+  f.flush();
+  f.close();
+  esp_camera_fb_return(fb);
+
+  if (written != fb->len) {
+    Serial.print("❌ Write incomplete for ");
+    Serial.print(path);
+    Serial.print(" written=");
+    Serial.print(written);
+    Serial.print(" expected=");
+    Serial.println(fb->len);
+    return false;
+  }
+
+  Serial.print("✅ Snapshot saved locally: ");
+  Serial.print(path);
+  Serial.print(" (");
+  Serial.print(written);
+  Serial.println(" bytes)");
+  return true;
+}
+
 void pushHistoryEventFirebase(const String& action, const String& by, const String& snapshotKey) {
   if (!Firebase.ready()) return;
 
@@ -477,19 +531,65 @@ void pushHistoryEventFirebase(const String& action, const String& by, const Stri
 }
 
 // =====================================================
-// Doorbell event (Firebase task)
+// ✅ NEW: upload ring file to Firebase (snapshots + notif + history)
 // =====================================================
-void handleDoorbellEventFirebase() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected -> doorbell event skipped (offline)");
-    return;
+static bool uploadRingFileToFirebase(const char* path) {
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return false;
+  if (!LittleFS.exists(path)) {
+    Serial.print("❌ Ring file missing: ");
+    Serial.println(path);
+    return false;
   }
 
-  setCameraProfileRing();
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    Serial.print("❌ Failed to open ring file: ");
+    Serial.println(path);
+    return false;
+  }
 
-  String b64 = captureJpegToBase64();
-  if (b64.isEmpty()) { Serial.println("Snapshot base64 empty -> skip event"); return; }
+  size_t len = f.size();
+  if (len == 0) { f.close(); return false; }
 
+  uint8_t* buf = (uint8_t*)malloc(len);
+  if (!buf) {
+    Serial.println("❌ malloc failed for jpeg upload");
+    f.close();
+    return false;
+  }
+
+  size_t r = f.read(buf, len);
+  f.close();
+  if (r != len) {
+    Serial.println("❌ failed reading jpeg file fully");
+    free(buf);
+    return false;
+  }
+
+  // base64
+  size_t outLen = 0;
+  size_t maxOut = 4 * ((len + 2) / 3) + 1;
+  unsigned char* outBuf = (unsigned char*)malloc(maxOut);
+  if (!outBuf) {
+    Serial.println("❌ malloc failed for base64");
+    free(buf);
+    return false;
+  }
+
+  int ret = mbedtls_base64_encode(outBuf, maxOut, &outLen, buf, len);
+  free(buf);
+
+  if (ret != 0) {
+    Serial.println("❌ base64 encode failed");
+    free(outBuf);
+    return false;
+  }
+
+  outBuf[outLen] = '\0';
+  String b64 = String((char*)outBuf);
+  free(outBuf);
+
+  // snapshots push
   FirebaseJson snap;
   snap.set("ts/.sv", "timestamp");
   snap.set("format", "jpeg_base64");
@@ -497,22 +597,33 @@ void handleDoorbellEventFirebase() {
 
   String snapKey;
   if (!pushJsonWithServerTs("/snapshots", snap, snapKey)) {
-    Serial.println("Snapshot push failed");
-    return;
+    Serial.println("❌ Snapshot push failed");
+    return false;
   }
 
-  Serial.println("Snapshot pushed: " + snapKey);
+  Serial.println("📤 Ring snapshot pushed: " + snapKey);
   Firebase.RTDB.setString(&fbdo, "/last_snapshot_key", snapKey);
 
+  // notification
   FirebaseJson notif;
   notif.set("type", "ring");
   notif.set("ts/.sv", "timestamp");
   notif.set("snapshotKey", snapKey);
 
   String notifKey;
-  if (pushJsonWithServerTs("/notifications", notif, notifKey)) Serial.println("Notification pushed: " + notifKey);
+  if (pushJsonWithServerTs("/notifications", notif, notifKey)) {
+    Serial.println("📣 Notification pushed: " + notifKey);
+  }
 
+  // history
   pushHistoryEventFirebase("ring", "Visitor", snapKey);
+
+  // cleanup local file after success
+  LittleFS.remove(path);
+  Serial.print("🧹 Deleted local ring file: ");
+  Serial.println(path);
+
+  return true;
 }
 
 // =====================================================
@@ -545,12 +656,11 @@ void pushLiveLatestSnapshotFirebase() {
   live.set("image", b64);
 
   if (!setJSONWithRetry("/live/latest", live, 2)) {
-  forceSmallLiveUntil = millis() + 10000; // ✅ only 10s small mode
-  liveBackoffUntil = millis() + 3000;
-} else {
-  forceSmallLiveUntil = 0; // ✅ go back to clear immediately
-}
-
+    forceSmallLiveUntil = millis() + 10000;
+    liveBackoffUntil = millis() + 3000;
+  } else {
+    forceSmallLiveUntil = 0;
+  }
 }
 
 // =====================================================
@@ -600,7 +710,6 @@ void maybeFetchAccessCodesSafelyFirebase() {
   }
 
   if (millis() - lastUserActionMs < IDLE_BEFORE_FETCH_MS) return;
-
   if (millis() - lastCodesFetchMs > CODES_BACKGROUND_REFRESH_MS) fetchAccessCodesFirebase();
 }
 
@@ -616,11 +725,8 @@ static void i2sInitOnce() {
   i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   i2s_config.sample_rate = 16000;
   i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-
-  // ✅ Most compatible: stereo frames
   i2s_config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-
   i2s_config.intr_alloc_flags = 0;
   i2s_config.dma_buf_count = 8;
   i2s_config.dma_buf_len = 256;
@@ -655,7 +761,6 @@ static void testBeep() {
     size_t written = 0;
     i2s_write(I2S_NUM_0, (const char*)frame, sizeof(frame), &written, portMAX_DELAY);
   }
-
   i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
@@ -669,6 +774,7 @@ static inline int16_t applyVol(int16_t s, int vol0_10) {
   return (int16_t)v;
 }
 
+// (WAV header + playWavFile) — kept from your original
 static bool readWavHeader(File& f, uint32_t& sampleRate, uint16_t& channels, uint16_t& bitsPerSample, uint32_t& dataStart, uint32_t& dataSize) {
   if (f.size() < 44) return false;
 
@@ -720,9 +826,9 @@ static bool readWavHeader(File& f, uint32_t& sampleRate, uint16_t& channels, uin
       if (!rd16(bitsPerSample)) return false;
 
       if (chunkSize > 16) f.seek(chunkStart + chunkSize);
-
-      if (audioFormat != 1) return false; // PCM only
+      if (audioFormat != 1) return false;
       gotFmt = true;
+
     } else if (memcmp(id, "data", 4) == 0) {
       dataStart = f.position();
       dataSize = chunkSize;
@@ -733,7 +839,6 @@ static bool readWavHeader(File& f, uint32_t& sampleRate, uint16_t& channels, uin
       f.seek(chunkStart + chunkSize);
     }
   }
-
   return gotFmt && gotData;
 }
 
@@ -798,8 +903,8 @@ static void playWavFile(const char* path, int vol0_10) {
     for (int i = 0; i + 1 < r; i += 2) {
       int16_t s = (int16_t)(in[i] | (in[i + 1] << 8));
       s = applyVol(s, vol0_10);
-      out[outIdx++] = s; // L
-      out[outIdx++] = s; // R
+      out[outIdx++] = s;
+      out[outIdx++] = s;
     }
 
     size_t written = 0;
@@ -861,39 +966,24 @@ static void pollAudioFirebase() {
   String cmd = fbdo.stringData();
   cmd.trim();
   if (cmd.length() == 0) cmd = "NONE";
-
   if (cmd == "NONE") return;
 
-  // Always reset so user can press again
   Firebase.RTDB.setString(&fbdo, FB_AUDIO_COMMAND, "NONE");
 
-  if (cmd == "STOP") {
-    requestStop();
-    return;
-  }
-
-  if (cmd == "BEEP") {
-    testBeep();
-    return;
-  }
+  if (cmd == "STOP") { requestStop(); return; }
+  if (cmd == "BEEP") { testBeep(); return; }
 
   String base = String(FB_AUDIO_MESSAGES) + "/" + cmd;
 
   bool enabled = false;
   if (Firebase.RTDB.getBool(&fbdo, (base + "/enabled").c_str())) enabled = fbdo.boolData();
-  if (!enabled) {
-    Serial.println("Audio message disabled: " + cmd);
-    return;
-  }
+  if (!enabled) { Serial.println("Audio message disabled: " + cmd); return; }
 
   String filePath;
   if (Firebase.RTDB.getString(&fbdo, (base + "/file").c_str())) filePath = fbdo.stringData();
   filePath.trim();
 
-  if (filePath.length() == 0) {
-    Serial.println("Audio message empty file: " + cmd);
-    return;
-  }
+  if (filePath.length() == 0) { Serial.println("Audio message empty file: " + cmd); return; }
 
   requestStop();
   vTaskDelay(pdMS_TO_TICKS(30));
@@ -942,24 +1032,22 @@ void firebaseTask(void* pv) {
       Serial.println("✅ Logged pin_lockout to Firebase history");
     }
 
-    if (ringRequested) {
-      ringRequested = false;
+    // ✅ NEW: upload queued ring snapshots whenever online
+    RingJob job;
+    while (xQueueReceive(ringQueue, &job, 0) == pdTRUE) {
       ringInProgress = true;
-      handleDoorbellEventFirebase();
+      bool ok = uploadRingFileToFirebase(job.filePath);
       ringInProgress = false;
-    }
 
-    UnlockEvent ev;
-    while (xQueueReceive(unlockQueue, &ev, 0) == pdTRUE) {
-      pushHistoryEventFirebase("unlock", String(ev.user), "");
-      if (ev.isOtp) {
-        Serial.println("One-Time Code used. Deleting...");
-        String path = String("/access_codes/") + String(ev.code);
-        Firebase.RTDB.deleteNode(&fbdo, path);
-        codesRefreshRequested = true;
+      if (!ok) {
+        // Can't upload now -> requeue for later
+        Serial.println("⏳ Ring upload failed/offline -> retry later");
+        xQueueSend(ringQueue, &job, 0);
+        break; // prevent endless tight loop
       }
     }
 
+    // Door status update
     if (doorStatusDirty && Firebase.ready()) {
       doorStatusDirty = false;
       bool openLocal;
@@ -975,7 +1063,6 @@ void firebaseTask(void* pv) {
     if (liveActive) pushLiveLatestSnapshotFirebase();
 
     maybeFetchAccessCodesSafelyFirebase();
-
     pollAudioFirebase();
 
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1022,8 +1109,8 @@ String getUserNameFromCache(const String& code) {
 // Setup
 // =====================================================
 void setup() {
-  testBeep();
   Serial.begin(115200);
+  delay(200);
   Serial.println();
 
   pinMode(LED_PIN, OUTPUT);
@@ -1039,12 +1126,14 @@ void setup() {
   audioQueue = xQueueCreate(4, sizeof(AudioJob));
   xTaskCreatePinnedToCore(audioTask, "audioTask", 8192, nullptr, 1, &audioTaskHandle, 0);
 
+  // ✅ NEW ring queue
+  ringQueue = xQueueCreate(8, sizeof(RingJob));
+
   if (!LittleFS.begin(true)) {
     Serial.println("❌ LittleFS init failed");
   } else {
     Serial.println("✅ LittleFS ready");
 
-    // list files
     File root = LittleFS.open("/");
     File file = root.openNextFile();
     while (file) {
@@ -1056,7 +1145,6 @@ void setup() {
       file = root.openNextFile();
     }
 
-    // ✅ offline: load last known codes
     loadCodesCacheFromFS();
   }
 
@@ -1116,7 +1204,7 @@ void setup() {
 #endif
   setCameraProfileRing();
 
-  // ---------------- WiFi (✅ timeout so we don't block offline mode)
+  // ---------------- WiFi (timeout)
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
 
@@ -1148,24 +1236,14 @@ void setup() {
     Firebase.begin(&fconfig, &auth);
     Firebase.reconnectWiFi(true);
 
-    // Create Firebase task pinned to core 1
-    xTaskCreatePinnedToCore(
-      firebaseTask,
-      "firebaseTask",
-      12288,
-      nullptr,
-      1,
-      nullptr,
-      1
-    );
+    xTaskCreatePinnedToCore(firebaseTask, "firebaseTask", 12288, nullptr, 1, nullptr, 1);
 
     doorStatusDirty = true;
     lastUserActionMs = millis();
-    codesRefreshRequested = true; // refresh when idle
+    codesRefreshRequested = true;
 
   } else {
-    Serial.println("\n⚠️ WiFi NOT connected -> running OFFLINE MODE (keypad still works)");
-    Serial.println("ℹ️ Will retry WiFi in loop()");
+    Serial.println("\n⚠️ WiFi NOT connected -> running OFFLINE MODE");
   }
 }
 
@@ -1184,7 +1262,7 @@ void loop() {
     WiFi.begin(ssid, password);
   }
 
-  // 1) Handle doorbell button presses (ISR count)
+  // ✅ 1) Doorbell presses: EVERY press => immediate local snapshot + queue upload
   static uint16_t lastHandled = 0;
   uint16_t cur = btnIsrCount;
 
@@ -1192,16 +1270,25 @@ void loop() {
     lastHandled++;
     lastUserActionMs = millis();
 
-    unsigned long nowMs = millis();
-    if (nowMs - lastRingMs > RING_COOLDOWN_MS) {
-      lastRingMs = nowMs;
-      ringRequested = true;
-      Serial.println("Doorbell button pressed! (queued)");
-      // offline feedback
-      if (WiFi.status() != WL_CONNECTED) testBeep();
+    Serial.println("🔔 Doorbell pressed!");
+
+    RingJob job{};
+    job.localMs = millis();
+    snprintf(job.filePath, sizeof(job.filePath), "/ring_%lu.jpg", (unsigned long)job.localMs);
+
+    setCameraProfileRing();
+    bool ok = captureJpegToFile(job.filePath);
+
+    if (ok) {
+      if (xQueueSend(ringQueue, &job, 0) != pdTRUE) {
+        Serial.println("⚠️ ringQueue full: keeping file but dropping upload job");
+      }
     } else {
-      Serial.println("Doorbell ignored (cooldown)");
+      Serial.println("❌ Ring snapshot capture failed");
+      testBeep();
     }
+
+    if (WiFi.status() != WL_CONNECTED) testBeep();
   }
 
   // 2) Apply remote command locally
@@ -1212,7 +1299,7 @@ void loop() {
     else if (cmd == DC_UNLOCK) unlockDoorLocal();
   }
 
-  // 3) Keypad read + Serial prints + lockout logic
+  // 3) Keypad read + lockout logic
   static unsigned long lastLockoutPrintMs = 0;
 
   char key;
@@ -1222,7 +1309,6 @@ void loop() {
     Serial.print("Keypad pressed: ");
     Serial.println(key);
 
-    // ✅ lockout active: disable PIN entry (allow '*' to clear buffer only)
     if (millis() < lockoutUntilMs) {
       if (millis() - lastLockoutPrintMs > 800) {
         lastLockoutPrintMs = millis();
@@ -1231,34 +1317,24 @@ void loop() {
         Serial.print(left);
         Serial.println("s");
       }
-
       if (key == '*') {
         inputCode = "";
         Serial.println("Entry cleared (*) while locked");
       }
-      continue; // ignore all other keys during lockout
+      continue;
     }
 
     if (key == '#') {
       Serial.print("Entered code: ");
       Serial.println(inputCode);
 
-      //if (inputCode.length() < 4) {
-       // Serial.println("Too short ❌");
-       // wrongAttempts++;
-       // blinkErrorLocal();
-       // inputCode = "";
-       // break;
-     // }
-
-      // Ask Firebase to refresh later when online (doesn't block offline)
       if (millis() - lastCodesFetchMs > CODES_MAX_AGE_BEFORE_UNLOCK_MS) {
         codesRefreshRequested = true;
       }
 
       if (codeExistsInCache(inputCode)) {
         Serial.println("ACCESS GRANTED ✅");
-        wrongAttempts = 0; // ✅ reset failures on success
+        wrongAttempts = 0;
 
         String userName = getUserNameFromCache(inputCode);
         unlockDoorLocal();
@@ -1270,8 +1346,6 @@ void loop() {
         xQueueSend(unlockQueue, &ev, 0);
 
       } else {
-        // if (inputCode.length() < 4) 
-        Serial.println("Too short ❌");
         Serial.println("ACCESS DENIED ❌");
         blinkErrorLocal();
 
@@ -1284,12 +1358,8 @@ void loop() {
           lockoutUntilMs = millis() + LOCKOUT_MS;
 
           Serial.println("⛔ LOCKOUT TRIGGERED (1 minute)");
-
-          // mark event for Firebase task to log when online
           lockoutEventPending = true;
           lockoutEventAttempts = MAX_WRONG_ATTEMPTS;
-
-          // extra feedback
           testBeep();
         }
       }
@@ -1305,7 +1375,6 @@ void loop() {
       break;
     }
 
-    // digits
     inputCode += key;
     Serial.print("Current buffer: ");
     Serial.println(inputCode);
