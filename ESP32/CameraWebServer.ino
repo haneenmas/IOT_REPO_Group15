@@ -26,8 +26,8 @@
 // ===========================
 // WiFi credentials
 // ===========================
-const char* ssid = "bezeqfiber";
-const char* password = "0522441867";
+const char* ssid = "ICST";
+const char* password = "arduino123";
 
 // ===========================
 // Firebase credentials
@@ -46,8 +46,8 @@ char keys[ROWS][COLS] = {
   {'7','4','1','*'},
 };
 
-byte rowPins[ROWS] = {1, 2, 3};
-byte colPins[COLS] = {21, 47, 48, 14};
+byte rowPins[ROWS] = {1, 2, 3}; 
+byte colPins[COLS] = {14, 21, 48, 47};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 // ===========================
@@ -277,9 +277,9 @@ static void playWavFile(const char* path, int vol0_10);
 // ===== AUDIO (MAX98357A) - LittleFS =====
 // =====================================================
 // Wiring:
-#define I2S_BCLK_PIN 39
-#define I2S_LRC_PIN  40
-#define I2S_DOUT_PIN 38
+#define I2S_BCLK_PIN 36
+#define I2S_LRC_PIN  35
+#define I2S_DOUT_PIN 37
 
 static const char* FB_AUDIO_COMMAND  = "/audio/command";
 static const char* FB_AUDIO_ACTIVE   = "/audio/active";
@@ -1022,6 +1022,7 @@ String getUserNameFromCache(const String& code) {
 // Setup
 // =====================================================
 void setup() {
+  testBeep();
   Serial.begin(115200);
   Serial.println();
 
