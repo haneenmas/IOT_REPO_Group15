@@ -93,7 +93,7 @@ class _DashboardPageState extends State<DashboardPage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Smart Doorbell'),
+        title: const Text('Smart Doorbelll'),
         centerTitle: true,
         elevation: 0,
         actions: [

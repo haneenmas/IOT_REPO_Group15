@@ -341,10 +341,10 @@ class _LiveViewTabState extends State<LiveViewTab> {
     // If we cleared because it's too stale OR never received yet:
     if (_lastLiveBytes == null) {
       return _bigFrame(
-        child: Center(
+        child: const Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: const [
+            children: [
               CircularProgressIndicator(color: Colors.white),
               SizedBox(height: 10),
               Text(
@@ -522,8 +522,8 @@ class _LiveViewTabState extends State<LiveViewTab> {
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: Colors.grey.shade200),
       ),
-      child: Row(
-        children: const [
+      child: const Row(
+        children: [
           Icon(Icons.speed, size: 18),
           SizedBox(width: 8),
           Text("Remote update rate: 1 frame / second"),

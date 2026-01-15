@@ -24,7 +24,7 @@ dependencies:
   shared_preferences: ^2.3.2
   flutter_mjpeg: ^2.0.4
   firebase_core: ^4.2.1
-  firebase_database: ^12.1.0
+  firebase_database: ^12.1.1
   web_socket_channel: ^3.0.3
 
 dev_dependencies:
