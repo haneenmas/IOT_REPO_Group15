@@ -15,7 +15,6 @@ class NotificationsTab extends StatefulWidget {
 class _NotificationsTabState extends State<NotificationsTab> {
   final DatabaseReference _db = FirebaseDatabase.instance.ref();
 
-  // Simple in-memory cache for snapshot images
   final Map<String, String?> _snapshotB64Cache = {};
 
   String _formatTs(dynamic ts) {
@@ -27,7 +26,6 @@ class _NotificationsTabState extends State<NotificationsTab> {
   }
 
   Future<String?> _getSnapshotBase64(String snapshotKey) async {
-    // cache hit
     if (_snapshotB64Cache.containsKey(snapshotKey)) {
       return _snapshotB64Cache[snapshotKey];
     }
@@ -44,11 +42,14 @@ class _NotificationsTabState extends State<NotificationsTab> {
   }
 
   @override
+  void dispose() {
+    _snapshotB64Cache.clear();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final query = _db
-        .child('notifications')
-        .orderByChild('ts')
-        .limitToLast(50);
+    final query = _db.child('notifications').orderByChild('ts').limitToLast(50);
 
     return Scaffold(
       body: Column(
@@ -63,20 +64,10 @@ class _NotificationsTabState extends State<NotificationsTab> {
           Expanded(
             child: FirebaseAnimatedList(
               query: query,
-              sort: (a, b) {
-                // newest first by ts if possible
-                final aMap = a.value is Map ? (a.value as Map) : {};
-                final bMap = b.value is Map ? (b.value as Map) : {};
-                final aTs = aMap['ts'];
-                final bTs = bMap['ts'];
-                final aMs = aTs is int ? aTs : int.tryParse(aTs?.toString() ?? '') ?? 0;
-                final bMs = bTs is int ? bTs : int.tryParse(bTs?.toString() ?? '') ?? 0;
-                return bMs.compareTo(aMs);
-              },
+              reverse: true, // ✅ newest first (no custom sort)
               itemBuilder: (context, snapshot, animation, index) {
                 final val = snapshot.value;
 
-                // Be robust: if someone pushed plain string, handle it.
                 String type = "unknown";
                 dynamic ts;
                 String? snapshotKey;
@@ -116,10 +107,11 @@ class _NotificationsTabState extends State<NotificationsTab> {
                               children: [
                                 Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
                                 const SizedBox(height: 4),
-                                Text("Time: ${_formatTs(ts)}",
-                                    style: const TextStyle(color: Colors.grey)),
+                                Text(
+                                  "Time: ${_formatTs(ts)}",
+                                  style: const TextStyle(color: Colors.grey),
+                                ),
                                 const SizedBox(height: 8),
-
                                 if (snapshotKey != null && snapshotKey.isNotEmpty)
                                   FutureBuilder<String?>(
                                     future: _getSnapshotBase64(snapshotKey),
