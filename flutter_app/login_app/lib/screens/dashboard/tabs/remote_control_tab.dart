@@ -77,11 +77,17 @@ class _RemoteControlTabState extends State<RemoteControlTab> {
   @override
   void initState() {
     super.initState();
+
+    // ✅ Android stability: ensure RTDB connection is online when tab initializes
+    FirebaseDatabase.instance.goOnline();
+
+    // Your existing behavior (keep)
     _setAudioActive(true);
   }
 
   @override
   void dispose() {
+    // Keep your behavior
     _setAudioActive(false);
     super.dispose();
   }
@@ -125,9 +131,9 @@ class _RemoteControlTabState extends State<RemoteControlTab> {
                   final m = Map<dynamic, dynamic>.from(raw);
                   final bool enabled = (m['enabled'] == true);
                   final String title =
-                      (m['title'] != null ? m['title'].toString() : k);
+                  (m['title'] != null ? m['title'].toString() : k);
                   final String file =
-                      (m['file'] != null ? m['file'].toString() : "");
+                  (m['file'] != null ? m['file'].toString() : "");
 
                   return ElevatedButton(
                     onPressed: enabled ? () => _playAudio(k) : null,
@@ -219,7 +225,6 @@ class _RemoteControlTabState extends State<RemoteControlTab> {
       padding: const EdgeInsets.all(16),
       child: Column(
         children: [
-          // Door status
           StreamBuilder<DatabaseEvent>(
             stream: _dbRef.child('door_status').onValue,
             builder: (context, snapshot) {
@@ -248,9 +253,8 @@ class _RemoteControlTabState extends State<RemoteControlTab> {
                       "Door is $status",
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
-                        color: isOpen
-                            ? Colors.green.shade900
-                            : Colors.red.shade900,
+                        color:
+                        isOpen ? Colors.green.shade900 : Colors.red.shade900,
                       ),
                     ),
                   ],
@@ -259,7 +263,6 @@ class _RemoteControlTabState extends State<RemoteControlTab> {
             },
           ),
 
-          // Lock/Unlock
           Row(
             children: [
               Expanded(
@@ -294,7 +297,6 @@ class _RemoteControlTabState extends State<RemoteControlTab> {
           const Divider(),
           const SizedBox(height: 12),
 
-          // Audio section
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
