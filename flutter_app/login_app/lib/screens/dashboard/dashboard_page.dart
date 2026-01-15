@@ -23,19 +23,20 @@ class DashboardPage extends StatefulWidget {
   State<DashboardPage> createState() => _DashboardPageState();
 }
 
-/// ✅ We use WidgetsBindingObserver to stop live when app goes background.
 class _DashboardPageState extends State<DashboardPage>
     with WidgetsBindingObserver {
   int _selectedIndex = 0;
 
-  // Single shared instance for all tabs
   final DoorbellService _doorbellService = DoorbellService();
-
-  // ✅ Firebase RTDB ref
   final DatabaseReference _db = FirebaseDatabase.instance.ref();
 
-  // ✅ Live tab index (must match BottomNavigationBar order)
   static const int _liveTabIndex = 0;
+
+  // ✅ Refresh keys for Android stability
+  int _notifRefresh = 0;
+  int _histRefresh = 0;
+  int _accessRefresh = 0;
+  int _otpRefresh = 0;
 
   Future<void> _setLiveActive(bool active) async {
     try {
@@ -50,7 +51,7 @@ class _DashboardPageState extends State<DashboardPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    // ✅ FIX: if app starts on Live tab, turn live ON immediately.
+    FirebaseDatabase.instance.goOnline();
     _setLiveActive(_selectedIndex == _liveTabIndex);
   }
 
@@ -61,7 +62,6 @@ class _DashboardPageState extends State<DashboardPage>
     super.dispose();
   }
 
-  /// ✅ Stop live when app backgrounded (minimized / screen off)
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
@@ -69,20 +69,41 @@ class _DashboardPageState extends State<DashboardPage>
         state == AppLifecycleState.inactive) {
       _setLiveActive(false);
     } else if (state == AppLifecycleState.resumed) {
+      FirebaseDatabase.instance.goOnline();
       _setLiveActive(_selectedIndex == _liveTabIndex);
+      setState(() {}); // reattach visible listeners
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final tabs = <Widget>[
-      LiveViewTab(doorbellService: _doorbellService),
-      NotificationsTab(doorbellService: _doorbellService),
-      HistoryTab(doorbellService: _doorbellService),
-      AccessTab(doorbellService: _doorbellService),
-      OneTimeCodesPage(doorbellService: _doorbellService),
-      RemoteControlTab(doorbellService: _doorbellService),
+      LiveViewTab(
+        key: const PageStorageKey('live'),
+        doorbellService: _doorbellService,
+      ),
+      NotificationsTab(
+        key: ValueKey('notifications_$_notifRefresh'),
+        doorbellService: _doorbellService,
+      ),
+      HistoryTab(
+        key: ValueKey('history_$_histRefresh'),
+        doorbellService: _doorbellService,
+      ),
+      AccessTab(
+        key: ValueKey('access_$_accessRefresh'),
+        doorbellService: _doorbellService,
+      ),
+      OneTimeCodesPage(
+        key: ValueKey('otp_$_otpRefresh'),
+        doorbellService: _doorbellService,
+      ),
+      RemoteControlTab(
+        key: const PageStorageKey('remote'),
+        doorbellService: _doorbellService,
+      ),
       SettingsTab(
+        key: const PageStorageKey('settings'),
         onLogout: () async {
           await _setLiveActive(false);
           widget.onLogout();
@@ -93,7 +114,7 @@ class _DashboardPageState extends State<DashboardPage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Smart Doorbelll'),
+        title: const Text('Smart Doorbell'),
         centerTitle: true,
         elevation: 0,
         actions: [
@@ -110,12 +131,10 @@ class _DashboardPageState extends State<DashboardPage>
           ),
         ],
       ),
-
       body: IndexedStack(
         index: _selectedIndex,
         children: tabs,
       ),
-
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
         type: BottomNavigationBarType.fixed,
@@ -123,42 +142,28 @@ class _DashboardPageState extends State<DashboardPage>
         elevation: 8,
         selectedItemColor: Theme.of(context).primaryColor,
         onTap: (index) async {
-          debugPrint('BottomNavigationBar tapped: $index');
+          FirebaseDatabase.instance.goOnline();
 
-          // ✅ Live ON only on live tab
           await _setLiveActive(index == _liveTabIndex);
 
-          setState(() => _selectedIndex = index);
+          setState(() {
+            _selectedIndex = index;
+
+            // ✅ Refresh tabs when entering
+            if (index == 1) _notifRefresh++;
+            if (index == 2) _histRefresh++;
+            if (index == 3) _accessRefresh++;
+            if (index == 4) _otpRefresh++;
+          });
         },
         items: const [
-          BottomNavigationBarItem(
-            icon: Icon(Icons.videocam),
-            label: 'Live View',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.notifications),
-            label: 'Notifications',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.history),
-            label: 'History',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.lock),
-            label: 'Access',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.vpn_key),
-            label: 'One-Time',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.settings_remote),
-            label: 'Remote',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.settings),
-            label: 'Settings',
-          ),
+          BottomNavigationBarItem(icon: Icon(Icons.videocam), label: 'Live View'),
+          BottomNavigationBarItem(icon: Icon(Icons.notifications), label: 'Notifications'),
+          BottomNavigationBarItem(icon: Icon(Icons.history), label: 'History'),
+          BottomNavigationBarItem(icon: Icon(Icons.lock), label: 'Access'),
+          BottomNavigationBarItem(icon: Icon(Icons.vpn_key), label: 'One-Time'),
+          BottomNavigationBarItem(icon: Icon(Icons.settings_remote), label: 'Remote'),
+          BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Settings'),
         ],
       ),
     );
