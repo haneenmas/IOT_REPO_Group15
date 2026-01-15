@@ -40,6 +40,12 @@ class _HistoryTabState extends State<HistoryTab> {
   }
 
   @override
+  void dispose() {
+    _snapshotB64Cache.clear();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final query = _dbRef.child('history').orderByChild('ts').limitToLast(80);
 
@@ -56,27 +62,10 @@ class _HistoryTabState extends State<HistoryTab> {
           Expanded(
             child: FirebaseAnimatedList(
               query: query,
-              sort: (a, b) {
-                final aVal = a.value;
-                final bVal = b.value;
-                int aMs = 0;
-                int bMs = 0;
-
-                if (aVal is Map) {
-                  final ts = aVal['ts'];
-                  aMs = ts is int ? ts : int.tryParse(ts?.toString() ?? '') ?? 0;
-                }
-                if (bVal is Map) {
-                  final ts = bVal['ts'];
-                  bMs = ts is int ? ts : int.tryParse(ts?.toString() ?? '') ?? 0;
-                }
-                return bMs.compareTo(aMs);
-              },
+              reverse: true, // ✅ newest first (no custom sort)
               itemBuilder: (context, snapshot, animation, index) {
                 final val = snapshot.value;
 
-                // Backward compatibility:
-                // If old history entries are plain strings, show them.
                 String title = "Event";
                 String subtitle = "";
                 IconData icon = Icons.history;
@@ -107,7 +96,6 @@ class _HistoryTabState extends State<HistoryTab> {
 
                   subtitle = "By: $by • Time: ${_formatTs(ts)}";
                 } else {
-                  // old format
                   title = val?.toString() ?? "Unknown";
                   subtitle = "Legacy history entry";
                   icon = Icons.history;
@@ -133,7 +121,6 @@ class _HistoryTabState extends State<HistoryTab> {
                             subtitle: Text(subtitle),
                             trailing: const Icon(Icons.access_time, size: 16),
                           ),
-
                           if (snapshotKey != null && snapshotKey.isNotEmpty)
                             FutureBuilder<String?>(
                               future: _getSnapshotBase64(snapshotKey),
