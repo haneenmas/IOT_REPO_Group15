@@ -13,6 +13,7 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <time.h>
 
 #include <Firebase_ESP_Client.h>
 #include <Keypad.h>
@@ -54,15 +55,16 @@ const char* password = "arduino123";
 #define ROWS 3
 #define COLS 4
 char keys[ROWS][COLS] = {
-  {'9','6','3','#'},
-  {'8','5','2','0'},
-  {'7','4','1','*'},
+  {'#','9','3','6'},
+  {'0','8','2','5'},
+  {'*','7','1','4'},
 };
 
 // ⚠️ On some ESP32-S3 boards GPIO1/2/3 are sensitive.
 // If you ever see boot/USB issues, tell me and I’ll give a safer pin set.
 byte rowPins[ROWS] = {1, 2, 3};
 byte colPins[COLS] = {14, 21, 48, 47};
+
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 // ===========================
@@ -1226,11 +1228,22 @@ void setup() {
     Serial.println(":81/stream");
 
     // ---------------- Firebase init
+    // ---- Time sync for TLS (required for Firebase SSL)
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    time_t now = time(nullptr);
+    uint32_t tStart = millis();
+    while (now < 1700000000 && (millis() - tStart) < 10000) {
+      delay(200);
+      now = time(nullptr);
+    }
+    Serial.print("⏱️ Unix time: ");
+    Serial.println((long)now);
+
     fconfig.api_key = API_KEY;
     fconfig.database_url = DATABASE_URL;
     fconfig.signer.test_mode = true;
 
-    fbdo.setBSSLBufferSize(16384, 16384);
+    fbdo.setBSSLBufferSize(8192, 2048);  // reduced to avoid TLS RAM failures
     fconfig.timeout.serverResponse = 15000;
 
     Firebase.begin(&fconfig, &auth);
