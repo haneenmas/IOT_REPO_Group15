@@ -42,7 +42,7 @@ See: `Documentation/` (Fritzing + wiring diagrams)
 ---
 
 ## Project Poster:
-See: `Documentation/` (project poster / screenshots)
+See: `Documentation/` (IOT Poster)
 
 ---
 
@@ -68,6 +68,6 @@ https://icst.cs.technion.ac.il/
 | 10 | I can detect suspicious attempts and keep my door access secure | the system to notify me when someone enters an incorrect one-time access code and to play beeping | Homeowner | Failed Access Attempt Alert | ✅ Done (beep + history logging hooks) |
 | 11 | I can still get basic operation like keys saved locally | the doorbell to still function when there is no Wi-Fi or internet (basic functionalities) | Homeowner | Offline Mode | ✅ Done (LittleFS cached codes + local unlock) |
 | 12 | brute-force guessing is discouraged and I’m alerted to suspicious activity | the lockpad to disable PIN entry for 2 minutes after 5 consecutive wrong attempts and log the event | Homeowner | PIN Lockout After 5 Failures | ✅ Done |
-| 13 | make a conversation | to talk with the person at the other side of the door | Homeowner | Two-Way Talk | ⏳ Not done |
-| 14 | snapshots and live video are clear at night without extra IR LEDs | camera auto increases brightness during time range (e.g., 7 PM–6 AM) according to light sensor | Homeowner | Night-Time Auto Brightness | ⏳ Not done |
+| 13 | make a conversation | to talk with the person at the other side of the door | Homeowner | Two-Way Talk |  ✅ Done |
+| 14 | snapshots and live video are clear at night without extra IR LEDs | camera auto increases brightness during time range (e.g., 7 PM–6 AM) according to light sensor | Homeowner | Night-Time Auto Brightness |  ✅ Done |
 
