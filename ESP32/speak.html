@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Doorbell Speak</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 16px; }
+    button { font-size: 18px; padding: 10px 16px; margin-right: 10px; }
+    #st { margin-top: 12px; white-space: pre-wrap; }
+    .hint { color:#444; margin-top:10px; line-height:1.35; }
+    code { background:#f4f4f4; padding:2px 4px; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <h2>Speak (Phone → ESP32 Speaker)</h2>
+
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+
+  <div id="st">Status: idle</div>
+
+  <div class="hint">
+    If mic is blocked on HTTP, allow it in Chrome:
+    tap 🔒/ⓘ → <b>Site settings</b> → <b>Microphone: Allow</b> → refresh.<br>
+    If still blocked, Chrome flag:
+    <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>
+    and add: <code id="origin"></code>
+  </div>
+
+<script>
+(() => {
+  const TARGET_RATE = 16000;
+
+  const startBtn = document.getElementById('start');
+  const stopBtn  = document.getElementById('stop');
+  const stEl     = document.getElementById('st');
+  document.getElementById('origin').textContent = location.origin;
+
+  let ws = null;
+  let audioCtx = null;
+  let stream = null;
+  let src = null;
+  let proc = null;
+
+  let lastError = "";   // keep error text so "closed" won't hide it
+
+  const st = (t) => { stEl.textContent = "Status: " + t; };
+
+  function floatTo16BitPCM(float32) {
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = (s < 0) ? (s * 0x8000) : (s * 0x7FFF);
+    }
+    return out;
+  }
+
+  function downsampleBuffer(buffer, inputRate, targetRate) {
+    if (targetRate === inputRate) return buffer;
+    const ratio = inputRate / targetRate;
+    const newLength = Math.floor(buffer.length / ratio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.floor((offsetResult + 1) * ratio);
+      let sum = 0, count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+        sum += buffer[i];
+        count++;
+      }
+      result[offsetResult] = count ? (sum / count) : 0;
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
+  }
+
+  async function start() {
+    lastError = "";
+    st("requesting mic...");
+
+    // 1) Request mic FIRST (so if it fails, we show the real error and don't open WS)
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+        video: false
+      });
+    } catch (err) {
+      const msg = (err && err.name) ? `${err.name}: ${err.message || ""}` : String(err);
+      lastError = "MIC ERROR\n" + msg +
+        "\n\nIf you see NotAllowedError/SecurityError → mic is blocked on HTTP.\n" +
+        "Allow mic in site settings / use the Chrome flag shown above.";
+      st(lastError);
+      return;
+    }
+
+    // 2) Now connect WS
+    st("mic granted, connecting ws...");
+    const proto = (location.protocol === "https:") ? "wss" : "ws";
+    const wsUrl = `${proto}://${location.host}/ws_speak`;
+
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      st("ws connected, streaming...");
+      src = audioCtx.createMediaStreamSource(stream);
+
+      proc = audioCtx.createScriptProcessor(1024, 1, 1);
+      proc.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== 1) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const down  = downsampleBuffer(input, audioCtx.sampleRate, TARGET_RATE);
+        const pcm16 = floatTo16BitPCM(down);
+        ws.send(pcm16.buffer);
+      };
+
+      src.connect(proc);
+      proc.connect(audioCtx.destination);
+
+      startBtn.disabled = true;
+      stopBtn.disabled  = false;
+    };
+
+    ws.onerror = () => {
+      lastError = "WS ERROR\nCould not connect to /ws_speak";
+      st(lastError);
+      stop(false);
+    };
+
+    ws.onclose = () => {
+      // Don't hide the real error behind "closed"
+      if (lastError) st(lastError);
+      else st("closed");
+      stop(false);
+    };
+  }
+
+  function stop(updateStatus=true) {
+    try { if (ws && ws.readyState === 1) ws.close(); } catch (e) {}
+    ws = null;
+
+    if (proc) { try { proc.disconnect(); } catch (e) {} proc = null; }
+    if (src)  { try { src.disconnect(); } catch (e) {} src = null; }
+
+    if (stream) {
+      try { stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+      stream = null;
+    }
+
+    startBtn.disabled = false;
+    stopBtn.disabled  = true;
+    if (updateStatus) st("stopped");
+  }
+
+  startBtn.addEventListener('click', () => start());
+  stopBtn.addEventListener('click', () => stop(true));
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,170 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Doorbell Live Audio</title>
+  <style>
+    body { font-family: Arial; padding: 16px; }
+    button { font-size: 18px; padding: 10px 16px; margin-right: 10px; }
+    #st { margin-top: 12px; }
+    .hint { color:#444; margin-top:8px; line-height:1.35; }
+  </style>
+</head>
+<body>
+  <h2>Live Audio (ESP32 → Phone)</h2>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="st">Status: idle</div>
+  <div class="hint">
+    Tip: press <b>Start</b>, stay silent ~1s (calibration), then speak normally.
+  </div>
+
+<script>
+let ws;
+let audioCtx;
+
+// scheduler
+let nextPlayTime = 0;
+let started = false;
+
+const SAMPLE_RATE = 16000;
+const FRAME_SAMPLES = 320;               // 20ms
+const FRAME_SEC = FRAME_SAMPLES / SAMPLE_RATE;
+
+const JITTER_FRAMES = 8;
+let frameQueue = [];
+
+const st = (t) => document.getElementById('st').textContent = "Status: " + t;
+
+// Simple, intelligibility-first audio graph (NOT too aggressive)
+let hp, lp, comp, g;
+
+let noiseFloor = 0.0;
+let calibrated = false;
+let calFrames = 0;
+const CAL_TARGET_FRAMES = 40;            // ~0.8s
+const FLOOR_ALPHA = 0.96;
+
+function ensureAudioGraph() {
+  if (hp) return;
+
+  // Keep more voice (less “muffled”)
+  hp = audioCtx.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 120;
+
+  lp = audioCtx.createBiquadFilter();
+  lp.type = "lowpass";
+  lp.frequency.value = 6000;
+
+  // Gentle compressor (helps intelligibility without destroying sound)
+  comp = audioCtx.createDynamicsCompressor();
+  comp.threshold.value = -24;
+  comp.knee.value = 16;
+  comp.ratio.value = 3.0;
+  comp.attack.value = 0.010;
+  comp.release.value = 0.18;
+
+  g = audioCtx.createGain();
+  g.gain.value = 1.05;
+
+  hp.connect(lp);
+  lp.connect(comp);
+  comp.connect(g);
+  g.connect(audioCtx.destination);
+}
+
+function scheduleFrame(float32) {
+  const buf = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
+  buf.copyToChannel(float32, 0);
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(hp);
+
+  const now = audioCtx.currentTime;
+  if (nextPlayTime < now + 0.03) nextPlayTime = now + 0.03;
+
+  src.start(nextPlayTime);
+  nextPlayTime += FRAME_SEC;
+}
+
+function pump() {
+  if (!started) return;
+  while (frameQueue.length) scheduleFrame(frameQueue.shift());
+  requestAnimationFrame(pump);
+}
+
+document.getElementById('start').onclick = async () => {
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  ensureAudioGraph();
+
+  noiseFloor = 0.0;
+  calibrated = false;
+  calFrames = 0;
+
+  const proto = (location.protocol === "https:") ? "wss" : "ws";
+  const url = `${proto}://${location.host}/ws_audio`;
+
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    st("connected (calibrating...)");
+    document.getElementById('start').disabled = true;
+    document.getElementById('stop').disabled = false;
+  };
+
+  ws.onclose = () => { st("closed"); started = false; };
+  ws.onerror = () => { st("error"); started = false; };
+
+  ws.onmessage = (ev) => {
+    const pcm16 = new Int16Array(ev.data);
+
+    const out = new Float32Array(pcm16.length);
+    let sum = 0;
+    for (let i = 0; i < pcm16.length; i++) {
+      const v = pcm16[i] / 32768;
+      out[i] = v;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / pcm16.length);
+
+    // learn noise floor, but don't mute speech
+    if (!calibrated) {
+      noiseFloor = (calFrames === 0) ? rms : (FLOOR_ALPHA * noiseFloor + (1 - FLOOR_ALPHA) * rms);
+      calFrames++;
+      if (calFrames >= CAL_TARGET_FRAMES) {
+        calibrated = true;
+        st("connected");
+      }
+      const calGate = Math.max(0.008, noiseFloor * 1.7 + 0.0010);
+      if (rms < calGate) out.fill(0);
+    } else {
+      const gate = Math.max(0.008, noiseFloor * 1.8 + 0.0010);
+      if (rms < gate) out.fill(0);
+    }
+
+    frameQueue.push(out);
+    if (frameQueue.length > 90) frameQueue = frameQueue.slice(-35);
+
+    if (!started && frameQueue.length >= JITTER_FRAMES) {
+      started = true;
+      nextPlayTime = audioCtx.currentTime + 0.16;
+      pump();
+    }
+  };
+};
+
+document.getElementById('stop').onclick = () => {
+  if (ws) ws.close();
+  document.getElementById('start').disabled = false;
+  document.getElementById('stop').disabled = true;
+  started = false;
+  frameQueue = [];
+  st("stopped");
+};
+</script>
+</body>
+</html>
