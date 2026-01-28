@@ -5,8 +5,8 @@
 A smart doorbell system using **ESP32-S3-CAM + Firebase Realtime Database + Flutter app**.  
 The system supports **snapshot-on-ring**, **semi-live remote view via Firebase snapshots**, **LAN streaming when near the device**, **secure keypad access with offline cache**, **remote unlock**, **event history + notifications**, and **pre-recorded voice messages** played at the door (MAX98357A + I2S + WAV on LittleFS).
 
-> ✅ Implemented: 1,2,3,4,5,6,9,10,11,12  
-> ⏳ Not implemented yet: 7,8,13,14
+> ✅ Implemented: 1,2,3,4,5,6,9,10,11,12,13,14
+> ⏳ Not implemented yet: 7,8
 
 ---
 
